@@ -1,45 +1,121 @@
 # Tony
 
-Tony is a Windows-focused voice and desktop assistant. It connects to LiveKit for voice sessions, uses the configured realtime model, and exposes tools for desktop control, communication, media, documents, screenshots, scheduling, and productivity tasks.
+Tony is a Windows desktop AI assistant that combines voice interaction, agent orchestration, and local desktop automation. It connects to LiveKit for real-time voice sessions and uses a configured AI provider for intelligent responses and tool execution.
 
-## Prerequisites
+This project includes a desktop UI, an agent runtime, prompt management, and a collection of Windows automation tools for tasks such as file handling, browser interaction, messaging, scheduling, document work, screenshots, app launching, and system actions.
 
-- Windows is the supported platform because desktop automation and `pywin32` integrations are used.
-- Python 3.12 is the tested interpreter for this workspace.
-- LiveKit credentials and the model/API credentials required by the tools.
+## Features
 
-## Setup
+- LiveKit-based voice sessions
+- Real-time AI assistant runtime
+- Desktop automation tools for Windows
+- File, folder, and app operations
+- Browser search and content interaction helpers
+- Media, screenshot, and productivity utilities
+- Local SQLite memory storage
+- PyQt-based desktop interface
+
+## Requirements
+
+Before running the project, make sure you have:
+
+- Windows 10 or Windows 11
+- Python 3.12
+- Git
+- A LiveKit project and valid credentials
+- API/model credentials for the configured AI provider
+- Desktop automation permissions for Windows actions
+
+## Clone the project
+
+```powershell
+git clone https://github.com/shriharis4/Tonyv2.git
+cd Tonyv2
+```
+
+## Set up the environment
+
+Create a virtual environment and install dependencies:
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
+```
+
+## Configure environment variables
+
+Create a local environment file:
+
+```powershell
 Copy-Item .env.example .env
 ```
 
-Fill `.env` with the real values. Never commit `.env`, API keys, passwords, or Firebase service-account files. Firebase credentials must be supplied through `FIREBASE_SERVICE_ACCOUNT_JSON` or `GOOGLE_APPLICATION_CREDENTIALS` pointing outside this repository. Voice enrollment remains an explicit local setup step through `enroll_user.py` when that feature is required.
+Then update `.env` with the required values for your LiveKit and AI provider setup. Do not commit `.env` to Git.
 
-## Run
+Typical configuration values may include:
+
+- LiveKit URL and token settings
+- AI provider API key
+- Model selection
+- Any service credentials required by the tools
+
+## Run the app
+
+Start the project with:
 
 ```powershell
 .\.venv\Scripts\python .\main.py
 ```
 
-The canonical path is `main.py` -> `tony.py` -> `core/runtime_agent.py`. The existing PyQt UI implementation remains in `tony.py`; its layout, styling, widgets, and animation behavior were preserved while identity labels were updated.
+This launches the desktop assistant and starts the runtime agent flow.
 
-## Structure
+## Project structure
 
-- `main.py`: single desktop entry point
-- `tony.py`: existing PyQt presentation and startup wiring
-- `core/runtime_agent.py`: LiveKit agent, routing, and tool registration
-- `core/prompts.py`: canonical Tony system and session prompts
-- `core/agent.py`: core agent export
-- `Tools/`: action-specific tool modules
-- `auth/` functionality: current voice authentication modules remain at the project root until their deployment contract is confirmed
-- `docs/ARCHITECTURE.md`: component and runtime flow
+- `main.py` — application entry point
+- `tony.py` — PyQt interface and app startup logic
+- `core/runtime_agent.py` — runtime agent and tool registration
+- `core/prompts.py` — system and session prompt definitions
+- `core/agent.py` — core agent exports
+- `Tools/` — automation and productivity tool modules
+- `memory_db.py` — local memory database logic
+- `requirements.txt` — Python dependencies
+- `livekit.toml` — LiveKit configuration
 
-## What changed from MJ/Nova
+## Runtime flow
 
-The active implementation now has Tony as its canonical identity and entrypoint. Duplicate Nova voice/UI implementations, duplicate prompt definitions, duplicate memory modules, obsolete build specs, scratch scripts, and Python caches were removed after checking that they were not reachable from the active entrypoint. Credentials were removed from source and moved to environment-variable lookups. Direct command routing and executor-based desktop/TTS operations remain on the existing hot path; no UI layout or styling rewrite was performed.
+The main execution path is:
 
-See `CHANGES.md` for the explicit deletion and consolidation report.
+```text
+main.py -> tony.py -> core/runtime_agent.py
+```
+
+The runtime agent is responsible for connecting the UI, the voice session, and the tool layer.
+
+## Troubleshooting
+
+### Virtual environment is not active
+Use:
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+```
+
+### Dependencies do not install
+Make sure you are using Python 3.12 and that your virtual environment is activated before running pip.
+
+### Credentials are missing
+Check your `.env` file and confirm all required LiveKit and AI provider values are present.
+
+### Windows automation does not work
+Some actions may require user interaction, desktop accessibility permissions, or admin access depending on your Windows configuration.
+
+## Security note
+
+Never commit secrets, API keys, or local runtime data to Git. Keep `.env` and any sensitive credentials outside the repository whenever possible.
+
+## License
+
+This project is provided as-is for development and personal use. If you plan to distribute or deploy it, review any dependency or service license requirements before doing so.
+
