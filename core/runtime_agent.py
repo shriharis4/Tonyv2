@@ -33,6 +33,7 @@ import time
 import json
 import socket
 import logging
+import difflib
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any, Optional, List
@@ -484,11 +485,13 @@ def reset_timer():
     current_timer = TurnTimer()
     return current_timer
 
-is_active = False
+is_active = True
 active_timeout_task = None
 is_speaking_locally = False
 sapi_lock = asyncio.Lock()
 _turn_in_progress = False
+_turn_started_at = 0.0          # when _turn_in_progress was last set True
+_last_turn_completed_at = 0.0   # when the last turn finished (for stale-transcript rejection)
 _last_handled_transcript = ""
 _last_handled_at = 0.0
 _last_spoken_text = ""
@@ -529,13 +532,14 @@ def _abort_model_turn(session: AgentSession) -> None:
 
 
 def _finish_direct_turn(session: AgentSession) -> None:
-    global is_active, _turn_in_progress, _llm_turn_open
+    global is_active, _turn_in_progress, _llm_turn_open, _last_turn_completed_at
     _abort_model_turn(session)
-    is_active = False
+    is_active = True  # Keep assistant active so follow-up commands are never dropped
     _turn_in_progress = False
     _llm_turn_open = False
+    _last_turn_completed_at = time.time()
     update_gui_status("Listening...")
-    print("[TURN] complete — idle listening")
+    print("[TURN] complete — idle listening (active)")
 
 
 def _is_repeated_command(clean_text: str, now: float) -> bool:
@@ -627,8 +631,11 @@ desktop_context = {
 }
 
 def send_text_command(command: str):
-    global background_loop, active_session, is_active
+    global background_loop, active_session, is_active, _last_spoken_text, _last_handled_transcript
     is_active = True
+    # Clear echo-suppression state so typed commands are never treated as echoes
+    _last_spoken_text = ""
+    _last_handled_transcript = ""
     if background_loop and active_session:
         asyncio.run_coroutine_threadsafe(
             handle_user_transcript(active_session, command),
@@ -730,12 +737,26 @@ async def route_command_directly(session: AgentSession, command: str) -> bool:
             await speak_local(session, "Hello Boss.")
             return True
 
-        # Time
-        if any(x in clean_command for x in ["what time is it", "current time", "what's the time", "tell me the time", "time"]):
+        # Time (English & Hindi / Hinglish)
+        if any(x in clean_command for x in ["what time", "current time", "what's the time", "tell me the time", "time", "टाइम", "समय", "samay", "kitne baje", "baje", "बजे"]):
             now_str = datetime.now().strftime("%I:%M %p")
             print(f"[ROUTER] Direct command matched: time -> {now_str}")
             session.clear_user_turn()
-            await speak_local(session, f"It's {now_str}.")
+            if any(x in clean_command for x in ["टाइम", "समय", "samay", "बजे", "baje"]):
+                await speak_local(session, f"अभी {now_str} हो रहा है।")
+            else:
+                await speak_local(session, f"It's {now_str}.")
+            return True
+
+        # Date (English & Hindi / Hinglish)
+        if any(x in clean_command for x in ["what date", "today's date", "current date", "what is the date", "date", "तारीख", "tarikh", "tareekh", "din", "दिन", "aaj kya hai"]):
+            today_str = datetime.now().strftime("%A, %B %d, %Y")
+            print(f"[ROUTER] Direct command matched: date -> {today_str}")
+            session.clear_user_turn()
+            if any(x in clean_command for x in ["तारीख", "tarikh", "दिन", "din"]):
+                await speak_local(session, f"आज की तारीख {datetime.now().strftime('%d %B %Y')} है।")
+            else:
+                await speak_local(session, f"Today is {today_str}.")
             return True
 
         # Copy & Paste
@@ -843,11 +864,13 @@ async def route_command_directly(session: AgentSession, command: str) -> bool:
                 await speak_local(session, f"Closing {close_target}.")
                 return True
 
-        # Open Applications
-        if any(x in clean_command for x in ["open", "launch", "run", "start", "show", "display"]):
+        # Open Applications (English, Hindi, Hinglish, Reverse syntax)
+        if any(x in clean_command for x in ["open", "launch", "run", "start", "show", "display", "khol", "kholo", "chalao", "curve", "karo", "ओपन", "खोल"]):
             open_target = None
             if "chrome" in clean_command or "browser" in clean_command:
                 open_target = "chrome"
+            elif "recycle" in clean_command or "रिसाइकल" in clean_command or "trash" in clean_command:
+                open_target = "recycle bin"
             elif "whatsapp" in clean_command:
                 open_target = "whatsapp"
             elif "spotify" in clean_command:
@@ -875,7 +898,17 @@ async def route_command_directly(session: AgentSession, command: str) -> bool:
                 print(f"[ROUTER] Direct command matched: open_app({open_target})")
                 session.clear_user_turn()
                 
-                if open_target == "spotify":
+                if open_target == "recycle bin":
+                    try:
+                        await asyncio.get_running_loop().run_in_executor(None, os.startfile, "shell:RecycleBinFolder")
+                    except Exception:
+                        pass
+                    desktop_context["last_opened_app"] = "recycle bin"
+                    if "रिसाइकल" in clean_command:
+                        await speak_local(session, "रिसाइकल बिन खोल दिया गया है।")
+                    else:
+                        await speak_local(session, "Opening Recycle Bin.")
+                elif open_target == "spotify":
                     await run_tool_helper(open_spotify)
                     desktop_context["last_opened_app"] = "spotify"
                     await speak_local(session, "Opening Spotify.")
@@ -1089,12 +1122,183 @@ async def route_command_directly(session: AgentSession, command: str) -> bool:
                 await speak_local(session, "No active PDF document context found. Please open a PDF first.")
             return True
 
+        # === NEW DIRECT ROUTES (Build 6) — close coverage gaps ===
+
+        # Web search — "search for X", "google X", "look up X"
+        search_match = re.search(r'(?:search\s+(?:the\s+web\s+)?(?:for\s+)?|google\s+|look\s+up\s+)(.+)', clean_command)
+        if search_match:
+            query = search_match.group(1).strip()
+            if query:
+                print(f"[ROUTER] Direct command matched: search_web({query})")
+                session.clear_user_turn()
+                result = await run_tool_helper(search_web, query)
+                response = result if isinstance(result, str) else f"Here are the results for '{query}'."
+                await speak_local(session, response[:300])
+                return True
+
+        # Weather — "what's the weather", "weather in X"
+        weather_match = re.search(r'(?:what\'?s\s+the\s+weather|how\'?s\s+the\s+weather|weather|temperature)\s*(?:in|at|for)?\s*(.*)', clean_command)
+        if weather_match and ("weather" in clean_command or "temperature" in clean_command):
+            city = weather_match.group(1).strip() or "auto"
+            print(f"[ROUTER] Direct command matched: get_weather({city})")
+            session.clear_user_turn()
+            result = await run_tool_helper(get_weather, city)
+            response = result if isinstance(result, str) else f"Weather information retrieved."
+            await speak_local(session, response[:300])
+            return True
+
+        # News — "latest news", "top news", "tell me the news"
+        if any(x in clean_command for x in ["news", "headlines"]):
+            print("[ROUTER] Direct command matched: get_top_news()")
+            session.clear_user_turn()
+            result = await run_tool_helper(get_top_news)
+            response = result if isinstance(result, str) else "Here are the top news stories."
+            await speak_local(session, response[:300])
+            return True
+
+        # System power — shutdown, restart, lock, sleep, hibernate
+        if any(x in clean_command for x in ["shut down", "shutdown", "restart", "reboot", "lock", "sleep", "hibernate"]):
+            action = "shutdown"
+            if "restart" in clean_command or "reboot" in clean_command:
+                action = "restart"
+            elif "lock" in clean_command:
+                action = "lock"
+            elif "sleep" in clean_command:
+                action = "sleep"
+            elif "hibernate" in clean_command:
+                action = "hibernate"
+            print(f"[ROUTER] Direct command matched: system_power_action({action})")
+            session.clear_user_turn()
+            await run_tool_helper(system_power_action, action)
+            await speak_local(session, f"Executing {action}.")
+            return True
+
+        # System status / info
+        if any(x in clean_command for x in ["system status", "system info", "battery", "cpu usage", "ram usage", "storage"]):
+            print("[ROUTER] Direct command matched: get_system_status()")
+            session.clear_user_turn()
+            result = await run_tool_helper(get_system_status)
+            response = result if isinstance(result, str) else "System information retrieved."
+            await speak_local(session, response[:300])
+            return True
+
+        # Show desktop
+        if clean_command in ["show desktop", "go to desktop", "desktop"]:
+            print("[ROUTER] Direct command matched: desktop_control(show)")
+            session.clear_user_turn()
+            await run_tool_helper(desktop_control, "show")
+            await speak_local(session, "Showing desktop.")
+            return True
+
+        # Virus scan
+        if any(x in clean_command for x in ["virus scan", "scan for viruses", "malware scan", "security scan", "scan my system"]):
+            print("[ROUTER] Direct command matched: scan_system_for_viruses()")
+            session.clear_user_turn()
+            result = await run_tool_helper(scan_system_for_viruses)
+            response = result if isinstance(result, str) else "Scan complete."
+            await speak_local(session, response[:300])
+            return True
+
+        # Read screen
+        if any(x in clean_command for x in ["read the screen", "read screen", "what's on screen", "read text on screen"]):
+            print("[ROUTER] Direct command matched: read_screen_text()")
+            session.clear_user_turn()
+            result = await run_tool_helper(read_screen_text)
+            response = result if isinstance(result, str) else "Screen text read."
+            await speak_local(session, response[:300])
+            return True
+
+        # Analyze screen
+        if any(x in clean_command for x in ["analyze screen", "analyze my screen", "describe my screen", "what's on my screen"]):
+            print("[ROUTER] Direct command matched: analyze_screen()")
+            session.clear_user_turn()
+            result = await run_tool_helper(analyze_screen, clean_command)
+            response = result if isinstance(result, str) else "Screen analyzed."
+            await speak_local(session, response[:300])
+            return True
+
+        # Type text — "type hello world"
+        type_match = re.search(r'^type\s+(.+)', clean_command)
+        if type_match:
+            text_to_type = type_match.group(1).strip()
+            print(f"[ROUTER] Direct command matched: type_user_message_auto({text_to_type})")
+            session.clear_user_turn()
+            await run_tool_helper(type_user_message_auto, text_to_type)
+            await speak_local(session, "Typed.")
+            return True
+
+        # Keyboard shortcuts — undo, redo, select all
+        if clean_command in ["undo"]:
+            print("[ROUTER] Direct command matched: press_key(ctrl+z)")
+            session.clear_user_turn()
+            await run_tool_helper(press_key, "ctrl+z")
+            await speak_local(session, "Undone.")
+            return True
+        if clean_command in ["redo"]:
+            print("[ROUTER] Direct command matched: press_key(ctrl+y)")
+            session.clear_user_turn()
+            await run_tool_helper(press_key, "ctrl+y")
+            await speak_local(session, "Redone.")
+            return True
+        if clean_command in ["select all", "select everything"]:
+            print("[ROUTER] Direct command matched: press_key(ctrl+a)")
+            session.clear_user_turn()
+            await run_tool_helper(press_key, "ctrl+a")
+            await speak_local(session, "All selected.")
+            return True
+
+        # File conversions — word/excel/ppt/image to PDF
+        if "to pdf" in clean_command:
+            session.clear_user_turn()
+            if "word" in clean_command or "doc" in clean_command:
+                print("[ROUTER] Direct command matched: word_to_pdf()")
+                await run_tool_helper(word_to_pdf)
+                await speak_local(session, "Converted Word to PDF.")
+            elif "excel" in clean_command or "spreadsheet" in clean_command:
+                print("[ROUTER] Direct command matched: excel_to_pdf()")
+                await run_tool_helper(excel_to_pdf)
+                await speak_local(session, "Converted Excel to PDF.")
+            elif "powerpoint" in clean_command or "ppt" in clean_command:
+                print("[ROUTER] Direct command matched: ppt_to_pdf()")
+                await run_tool_helper(ppt_to_pdf)
+                await speak_local(session, "Converted PowerPoint to PDF.")
+            elif "image" in clean_command or "picture" in clean_command or "photo" in clean_command:
+                print("[ROUTER] Direct command matched: image_to_pdf()")
+                await run_tool_helper(image_to_pdf)
+                await speak_local(session, "Converted image to PDF.")
+            else:
+                return False
+            return True
+
+        # Spotify liked songs (missed by existing Spotify block)
+        if any(x in clean_command for x in ["play liked songs", "play my liked", "play favorites", "play my favorites"]):
+            print("[ROUTER] Direct command matched: spotify_play_liked()")
+            session.clear_user_turn()
+            await run_tool_helper(spotify_play_liked)
+            await speak_local(session, "Playing your liked songs.")
+            return True
+
+        # Fix code error
+        if any(x in clean_command for x in ["fix code error", "fix this error", "fix my code", "debug code"]):
+            print("[ROUTER] Direct command matched: fix_code_error()")
+            session.clear_user_turn()
+            result = await run_tool_helper(fix_code_error)
+            response = result if isinstance(result, str) else "Code error fixed."
+            await speak_local(session, response[:300])
+            return True
+
     except Exception as e:
         print(f"[ROUTER] Error executing direct tool: {e}")
         import traceback
         traceback.print_exc()
+        # CRITICAL: reset turn state on error so the assistant isn't permanently wedged
+        global _turn_in_progress, _llm_turn_open, _last_turn_completed_at
+        _turn_in_progress = False
+        _llm_turn_open = False
+        _last_turn_completed_at = time.time()
         session.clear_user_turn()
         await speak_local(session, "Sorry, I encountered an error running that command.")
+        update_gui_status("Listening...")
         return True
 
     return False
@@ -1184,27 +1388,46 @@ def reset_active_timeout(session):
     active_timeout_task = asyncio.create_task(timeout_coro())
 
 async def handle_user_transcript(session: AgentSession, transcript: str):
-    global is_active, active_timeout_task, _turn_in_progress
+    global is_active, active_timeout_task, _turn_in_progress, _turn_started_at
     global _last_handled_transcript, _last_handled_at, _llm_turn_open
     clean_text = transcript.strip().lower()
     print(f"[ROUTER] received: {clean_text}")
     print(f"[VOICE] User speech transcript: '{clean_text}' (is_active={is_active})")
 
     now = time.time()
+
+    # --- TIMEOUT BACKSTOP ---
+    # If _turn_in_progress has been True for longer than 30s, force-reset it.
+    # This prevents the assistant from being permanently wedged if a turn
+    # completes without reaching any of the normal reset paths.
+    if _turn_in_progress and (now - _turn_started_at) > 30.0:
+        print(f"[ROUTER] SAFETY RESET — _turn_in_progress stuck for {now - _turn_started_at:.1f}s, force-clearing")
+        _turn_in_progress = False
+        _llm_turn_open = False
+
     if _turn_in_progress:
         print("[ROUTER] ignored — turn already in progress")
         _abort_model_turn(session)
         return
+
+    # --- EXACT DUPLICATE suppression (same transcript within 6s) ---
     if clean_text and clean_text == _last_handled_transcript and (now - _last_handled_at) < 6.0:
         print("[ROUTER] ignored — duplicate transcript of completed task")
         _abort_model_turn(session)
         return
-    if _last_spoken_text and clean_text and (
-        clean_text in _last_spoken_text or _last_spoken_text in clean_text
-    ) and (now - _last_handled_at) < 8.0:
-        print("[ROUTER] ignored — echo of Tony's last spoken line")
-        _abort_model_turn(session)
-        return
+
+    # --- ECHO suppression (mic picks up Tony's own speech) ---
+    # FIXED: Was using bidirectional substring match which falsely ate short
+    # commands like "play" if Tony had said "playing music on spotify".
+    # Now uses SequenceMatcher ratio >= 0.85 (near-exact match only) with
+    # a tighter 4s window instead of 8s.
+    if _last_spoken_text and clean_text and (now - _last_handled_at) < 4.0:
+        echo_ratio = difflib.SequenceMatcher(None, clean_text, _last_spoken_text).ratio()
+        if echo_ratio >= 0.85:
+            print(f"[ROUTER] ignored — echo of Tony's last spoken line (similarity={echo_ratio:.2f})")
+            _abort_model_turn(session)
+            return
+
     if _is_repeated_command(clean_text, now):
         session.clear_user_turn()
         return
@@ -1213,56 +1436,46 @@ async def handle_user_transcript(session: AgentSession, transcript: str):
     timer.t4 = time.time()
     print("[T4] command router started")
 
-    wake_word_match = re.search(r'\b(hey\s+)?tony\b', clean_text)
-
-    if not is_active:
-        if wake_word_match:
-            is_active = True
-            print("[ROUTER] Wake word detected!")
-            start_idx = wake_word_match.end()
-            command_after = clean_text[start_idx:].strip()
-
-            if command_after:
-                print(f"[ROUTER] Direct command immediately after wake word: '{command_after}'")
-                update_gui_status("Executing...")
-                _turn_in_progress = True
-                handled = await route_command_directly(session, command_after)
-                if handled:
-                    _last_handled_transcript = clean_text
-                    _last_handled_at = time.time()
-                    _finish_direct_turn(session)
-                else:
-                    _llm_turn_open = True
-                    _turn_in_progress = True
-                    update_gui_status("Processing...")
-                    timer.t5 = time.time()
-                    print("[T5] LLM request started")
-            else:
-                session.clear_user_turn()
-                update_gui_status("Speaking...")
-                await speak_local(session, "Yes?")
-                reset_active_timeout(session)
-        else:
-            print("[ROUTER] Speech ignored (no wake word detected)")
+    wake_word_match = re.search(r'^\s*(?:hey\s+)?tony\b[\s,:]*', clean_text)
+    if wake_word_match:
+        command_after = clean_text[wake_word_match.end():].strip()
+        if not command_after:
+            # User only said "Tony" or "Hey Tony"
             session.clear_user_turn()
+            update_gui_status("Speaking...")
+            await speak_local(session, "Yes, I am listening!")
+            return
+        effective_command = command_after
     else:
-        if active_timeout_task:
-            active_timeout_task.cancel()
+        effective_command = clean_text
 
-        update_gui_status("Executing...")
-        _turn_in_progress = True
-        handled = await route_command_directly(session, clean_text)
-        if handled:
-            print("[ROUTER] Direct command handled")
-            _last_handled_transcript = clean_text
-            _last_handled_at = time.time()
+    if active_timeout_task:
+        active_timeout_task.cancel()
+
+    update_gui_status("Executing...")
+    _turn_in_progress = True
+    _turn_started_at = time.time()
+    handled = await route_command_directly(session, effective_command)
+    if handled:
+        print("[ROUTER] Direct command handled")
+        _last_handled_transcript = clean_text
+        _last_handled_at = time.time()
+        _finish_direct_turn(session)
+    else:
+        print(f"[ROUTER] Direct routing failed, generating reply via LLM for: '{clean_text}'")
+        _llm_turn_open = True
+        update_gui_status("Processing...")
+        timer.t5 = time.time()
+        print("[T5] LLM request started (fallback from direct router)")
+        try:
+            # Explicitly instruct the LiveKit session model to generate a response
+            await session.generate_reply(
+                instructions=f"The user said: '{transcript}'. Respond concisely, directly and helpfully."
+            )
+        except Exception as e:
+            print(f"[LLM] Error in generate_reply: {e}")
+            await speak_local(session, "I heard you, but I couldn't process that command.")
             _finish_direct_turn(session)
-        else:
-            print("[ROUTER] Direct routing failed, forwarding to LLM")
-            _llm_turn_open = True
-            update_gui_status("Processing...")
-            timer.t5 = time.time()
-            print("[T5] LLM request started")
 
 _global_llm = None
 
@@ -1619,6 +1832,7 @@ async def entrypoint(ctx: agents.JobContext):
                 timer.command = ev.transcript
                 print(f"[T3] transcript received: '{ev.transcript}'")
                 print(f"[STT] transcript received: {ev.transcript}")
+
                 asyncio.create_task(handle_user_transcript(session, ev.transcript))
     @session.on("agent_state_changed")
     def on_agent_state(ev: agents.voice.AgentStateChangedEvent):
@@ -1626,9 +1840,10 @@ async def entrypoint(ctx: agents.JobContext):
         timer = get_or_create_timer()
 
         if ev.new_state in ["listening", "idle"]:
-            global _turn_in_progress, _llm_turn_open
+            global _turn_in_progress, _llm_turn_open, _last_turn_completed_at
             _turn_in_progress = False
             _llm_turn_open = False
+            _last_turn_completed_at = time.time()
             update_gui_status("Listening...")
         elif ev.new_state == "thinking":
             update_gui_status("Thinking...")
@@ -1642,6 +1857,12 @@ async def entrypoint(ctx: agents.JobContext):
             print("[T6] LLM response received")
             print("[T9] response started")
             print("[LLM] response received")
+            # Log LLM-fallback path timing breakdown
+            if timer.t4 and timer.t5 and timer.t6:
+                print(f"[PERF-LLM] Transcript→Router: {timer.t5 - timer.t4:.3f}s")
+                print(f"[PERF-LLM] Router→LLM-response: {timer.t6 - timer.t5:.3f}s")
+                if timer.t3:
+                    print(f"[PERF-LLM] Total transcript→response: {timer.t6 - timer.t3:.3f}s")
 
         # Log response completed when transitioning out of speaking
         if ev.old_state == "speaking" and ev.new_state != "speaking":
@@ -1669,9 +1890,10 @@ async def entrypoint(ctx: agents.JobContext):
                     text = " ".join(texts)
             if text:
                 update_gui_response(text)
-            global _turn_in_progress, _llm_turn_open
+            global _turn_in_progress, _llm_turn_open, _last_turn_completed_at
             _turn_in_progress = False
             _llm_turn_open = False
+            _last_turn_completed_at = time.time()
 
     @session.on("close")
     def on_session_close(ev: agents.voice.CloseEvent):
