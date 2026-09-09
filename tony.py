@@ -56,7 +56,7 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                             QFrame, QScrollArea, QLineEdit)
 from PyQt5.QtCore import (QTimer, Qt, QPoint, QPointF, QRectF, QPropertyAnimation, QSize,
                          QEasingCurve, QParallelAnimationGroup, QSequentialAnimationGroup,
-                         QObject, pyqtSignal)
+                         QObject, pyqtSignal, QThread)
 from PyQt5.QtGui import (QPainter, QPen, QBrush, QColor, QFont, QFontMetrics,
                          QLinearGradient, QRadialGradient, QPainterPath)
 
@@ -455,9 +455,9 @@ class SystemMonitorWidget(QWidget):
         
         self.init_ui()
         
-        self.timer = QTimer(self)
-        self.timer.timeout.connect(self.update_stats)
-        self.timer.start(2000)
+        self.worker = SystemMonitorWorker()
+        self.worker.stats_updated.connect(self._on_stats_updated)
+        self.worker.start()
         
     def init_ui(self):
         layout = QVBoxLayout(self)
@@ -568,42 +568,59 @@ class SystemMonitorWidget(QWidget):
         """)
         layout.addWidget(self.ram_bar)
 
-    def update_stats(self):
-        self.cpu_usage = psutil.cpu_percent()
-        self.ram_usage = psutil.virtual_memory().percent
+    def _on_stats_updated(self, cpu_usage, ram_usage, gpu_load, gpu_temp, gpu_clock):
+        self.cpu_usage = cpu_usage
+        self.ram_usage = ram_usage
+        self.gpu_load = gpu_load
+        self.gpu_temp = gpu_temp
+        self.gpu_clock = gpu_clock
         
-        try:
-            res = subprocess.run(
-                ['nvidia-smi', '--query-gpu=utilization.gpu,temperature.gpu,clocks.gr', '--format=csv,noheader,nounits'],
-                capture_output=True, text=True, timeout=0.5
-            )
-            if res.returncode == 0 and res.stdout.strip():
-                parts = res.stdout.strip().split(',')
-                if len(parts) >= 3:
-                    self.gpu_load = float(parts[0].strip())
-                    self.gpu_temp = int(parts[1].strip())
-                    self.gpu_clock = int(parts[2].strip())
-            else:
-                self.gpu_load = random.randint(5, 15)
-                self.gpu_temp = 42 + random.randint(-1, 1)
-                self.gpu_clock = 300
-        except:
-            self.gpu_load = random.randint(5, 15)
-            self.gpu_temp = 42 + random.randint(-1, 1)
-            self.gpu_clock = 300
+        self.cpu_bar.setValue(int(cpu_usage))
+        self.cpu_val_lbl.setText(f"{cpu_usage:.1f}%")
+        
+        self.ram_bar.setValue(int(ram_usage))
+        self.ram_val_lbl.setText(f"{ram_usage:.1f}%")
+        
+        self.gpu_bar.setValue(int(gpu_load))
+        self.gpu_val_lbl.setText(f"{gpu_load:.1f}%")
+        
+        self.gpu_clock_lbl.setText(f"GPU CLOCK\n{gpu_clock} MHz")
+        self.gpu_temp_lbl.setText(f"TEMP\n{gpu_temp}°C")
+        self.gpu_load_lbl.setText(f"LOAD\n{int(gpu_load)}%")
+
+class SystemMonitorWorker(QThread):
+    stats_updated = pyqtSignal(float, float, float, int, int)
+
+    def run(self):
+        while True:
+            cpu_usage = psutil.cpu_percent()
+            ram_usage = psutil.virtual_memory().percent
+            gpu_load, gpu_temp, gpu_clock = 0.0, 42, 300
             
-        self.cpu_bar.setValue(int(self.cpu_usage))
-        self.cpu_val_lbl.setText(f"{self.cpu_usage:.1f}%")
-        
-        self.ram_bar.setValue(int(self.ram_usage))
-        self.ram_val_lbl.setText(f"{self.ram_usage:.1f}%")
-        
-        self.gpu_bar.setValue(int(self.gpu_load))
-        self.gpu_val_lbl.setText(f"{self.gpu_load:.1f}%")
-        
-        self.gpu_clock_lbl.setText(f"GPU CLOCK\n{self.gpu_clock} MHz")
-        self.gpu_temp_lbl.setText(f"TEMP\n{self.gpu_temp}°C")
-        self.gpu_load_lbl.setText(f"LOAD\n{int(self.gpu_load)}%")
+            try:
+                # Provide creationflags to hide the subprocess window on Windows
+                import subprocess
+                res = subprocess.run(
+                    ['nvidia-smi', '--query-gpu=utilization.gpu,temperature.gpu,clocks.gr', '--format=csv,noheader,nounits'],
+                    capture_output=True, text=True, timeout=0.5, creationflags=subprocess.CREATE_NO_WINDOW
+                )
+                if res.returncode == 0 and res.stdout.strip():
+                    parts = res.stdout.strip().split(',')
+                    if len(parts) >= 3:
+                        gpu_load = float(parts[0].strip())
+                        gpu_temp = int(parts[1].strip())
+                        gpu_clock = int(parts[2].strip())
+                else:
+                    gpu_load = random.randint(5, 15)
+                    gpu_temp = 42 + random.randint(-1, 1)
+                    gpu_clock = 300
+            except:
+                gpu_load = random.randint(5, 15)
+                gpu_temp = 42 + random.randint(-1, 1)
+                gpu_clock = 300
+                
+            self.stats_updated.emit(cpu_usage, ram_usage, gpu_load, gpu_temp, gpu_clock)
+            time.sleep(2.0)
 
 class VoiceEngineWidget(QWidget):
     """Left side bottom panel for Voice Engine monitoring"""
@@ -1050,9 +1067,18 @@ class CentralVisualizerCore(QWidget):
         self.setMinimumSize(400, 400)
         self.pulse_phase = 0.0
         self.state = "idle"
+        
+        # Pre-allocate cached objects to avoid allocation on every frame
+        self._cached_ring_path = QPainterPath()
+        self._cached_inner_ring_path = QPainterPath()
+        self._cached_inner_ring_path.addEllipse(QPointF(0, 0), 120, 120)
+        
+        # Precompute math
+        self._math_sin = [math.sin(i) for i in range(12)]
+        
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.update_anim)
-        self.timer.start(16)
+        self.timer.start(33)  # 30 FPS is plenty for smooth pulsing, saves 50% CPU over 16ms
         
     def set_state(self, state):
         self.state = state.lower()
@@ -1069,65 +1095,63 @@ class CentralVisualizerCore(QWidget):
         
         state = self.state
         if "listening" in state:
-            core_color = QColor(255, 0, 0)
-            particle_color = QColor(255, 215, 0)
+            c_r, c_g, c_b = 255, 0, 0
+            p_r, p_g, p_b = 255, 215, 0
             rot_speed = 15.0
             pulse_amp = 8.0
         elif "speaking" in state:
-            core_color = QColor(0, 255, 255)
-            particle_color = QColor(255, 255, 255)
+            c_r, c_g, c_b = 0, 255, 255
+            p_r, p_g, p_b = 255, 255, 255
             rot_speed = 10.0
             pulse_amp = 12.0 * math.sin(self.pulse_phase * 2)
         elif "processing" in state or "thinking" in state:
-            core_color = QColor(255, 255, 0)
-            particle_color = QColor(255, 170, 0)
+            c_r, c_g, c_b = 255, 255, 0
+            p_r, p_g, p_b = 255, 170, 0
             rot_speed = 35.0
             pulse_amp = 4.0
         elif "executing" in state:
-            core_color = QColor(255, 170, 0)
-            particle_color = QColor(255, 0, 0)
+            c_r, c_g, c_b = 255, 170, 0
+            p_r, p_g, p_b = 255, 0, 0
             rot_speed = 25.0
             pulse_amp = 10.0
         elif "error" in state:
-            core_color = QColor(255, 0, 0)
-            particle_color = QColor(255, 255, 255)
+            c_r, c_g, c_b = 255, 0, 0
+            p_r, p_g, p_b = 255, 255, 255
             rot_speed = 5.0
             pulse_amp = 15.0 if int(self.pulse_phase * 2) % 2 == 0 else 0.0
         else:
-            core_color = QColor(255, 182, 193)
-            particle_color = QColor(255, 0, 0, 80)
+            c_r, c_g, c_b = 255, 182, 193
+            p_r, p_g, p_b = 255, 0, 0
             rot_speed = 5.0
             pulse_amp = 3.0
             
         outer_gradient = QRadialGradient(cx, cy, 220)
-        outer_gradient.setColorAt(0, QColor(core_color.red(), core_color.green(), core_color.blue(), 30))
-        outer_gradient.setColorAt(0.6, QColor(core_color.red(), core_color.green(), core_color.blue(), 8))
+        outer_gradient.setColorAt(0, QColor(c_r, c_g, c_b, 30))
+        outer_gradient.setColorAt(0.6, QColor(c_r, c_g, c_b, 8))
         outer_gradient.setColorAt(1, QColor(0, 0, 0, 0))
         painter.setBrush(QBrush(outer_gradient))
         painter.setPen(Qt.NoPen)
         painter.drawEllipse(QPointF(cx, cy), 220, 220)
         
-        ring_path = QPainterPath()
+        self._cached_ring_path.clear()
         ring_radius = 160 + pulse_amp
-        ring_path.addEllipse(QPointF(cx, cy), ring_radius, ring_radius)
+        self._cached_ring_path.addEllipse(QPointF(cx, cy), ring_radius, ring_radius)
         
-        pen = QPen(QColor(core_color.red(), core_color.green(), core_color.blue(), 80))
+        pen = QPen(QColor(c_r, c_g, c_b, 80))
         pen.setWidth(1)
         pen.setDashPattern([10, 15, 2, 15])
         painter.setPen(pen)
-        painter.drawPath(ring_path)
+        painter.drawPath(self._cached_ring_path)
         
         painter.save()
         painter.translate(cx, cy)
         painter.rotate(self.pulse_phase * rot_speed)
         
-        inner_ring_path = QPainterPath()
-        inner_ring_path.addEllipse(QPointF(0, 0), 120, 120)
-        pen = QPen(QColor(core_color.red(), core_color.green(), core_color.blue(), 120))
+        pen = QPen(QColor(c_r, c_g, c_b, 120))
         pen.setWidth(2)
         pen.setDashPattern([30, 20])
         painter.setPen(pen)
-        painter.drawPath(inner_ring_path)
+        painter.drawPath(self._cached_inner_ring_path)
         
         for i in range(12):
             painter.rotate(30)
@@ -1143,41 +1167,41 @@ class CentralVisualizerCore(QWidget):
             
             p_size = 3 + 2 * math.sin(self.pulse_phase * 2 + i)
             alpha = 150 + int(100 * math.sin(self.pulse_phase * 3 + i))
-            color = QColor(particle_color.red(), particle_color.green(), particle_color.blue(), alpha)
+            color = QColor(p_r, p_g, p_b, max(0, min(255, alpha)))
             painter.setBrush(QBrush(color))
             painter.setPen(Qt.NoPen)
             painter.drawEllipse(QPointF(px, py), p_size, p_size)
             
         core_gradient = QRadialGradient(cx, cy, 70)
         core_gradient.setColorAt(0, QColor(255, 255, 255, 180))
-        core_gradient.setColorAt(0.3, QColor(core_color.red(), core_color.green(), core_color.blue(), 120))
+        core_gradient.setColorAt(0.3, QColor(c_r, c_g, c_b, 120))
         core_gradient.setColorAt(0.8, QColor(25, 9, 19, 100))
         core_gradient.setColorAt(1, QColor(0, 0, 0, 255))
         
         painter.setBrush(QBrush(core_gradient))
-        pen = QPen(QColor(core_color.red(), core_color.green(), core_color.blue(), 200))
+        pen = QPen(QColor(c_r, c_g, c_b, 200))
         pen.setWidth(3)
         painter.setPen(pen)
         painter.drawEllipse(QPointF(cx, cy), 65, 65)
         
         bg_glow = QRadialGradient(cx, cy, 30)
-        bg_glow.setColorAt(0, QColor(core_color.red(), core_color.green(), core_color.blue(), 150))
+        bg_glow.setColorAt(0, QColor(c_r, c_g, c_b, 150))
         bg_glow.setColorAt(1, QColor(0, 0, 0, 0))
         painter.setBrush(QBrush(bg_glow))
         painter.setPen(Qt.NoPen)
-        painter.drawEllipse(int(cx - 30), int(cy - 30), 60, 60)
+        painter.drawEllipse(QPointF(cx, cy), 30, 30)
         
-        painter.setFont(QFont("Segoe UI", 32, QFont.Black))
+        painter.setFont(QFont("Segoe UI", 24, QFont.Bold))
         
         for i in range(4, 0, -1):
             alpha = 60 - i * 12
-            painter.setPen(QPen(QColor(core_color.red(), core_color.green(), core_color.blue(), alpha), i))
+            painter.setPen(QPen(QColor(c_r, c_g, c_b, alpha), i))
             painter.drawText(int(cx - 80), int(cy - 50), 160, 100, Qt.AlignCenter, "TONY")
             
         txt_grad = QLinearGradient(cx - 30, cy - 30, cx + 30, cy + 30)
         txt_grad.setColorAt(0, QColor(255, 255, 255))
         txt_grad.setColorAt(0.5, QColor(255, 182, 193))
-        txt_grad.setColorAt(1, QColor(core_color.red(), core_color.green(), core_color.blue()))
+        txt_grad.setColorAt(1, QColor(c_r, c_g, c_b))
         painter.setPen(QPen(QBrush(txt_grad), 2))
         painter.drawText(int(cx - 80), int(cy - 50), 160, 100, Qt.AlignCenter, "TONY")
 
@@ -1405,81 +1429,7 @@ class ModernFloatingWindow(QMainWindow):
         
         main_layout.addLayout(content_layout)
         
-        bottom_bar = QHBoxLayout()
-        bottom_bar.setContentsMargins(10, 5, 10, 5)
-        bottom_bar.setSpacing(15)
-        
-        self.mode_buttons = []
-        modes = [
-            ("SILENT", "#a000a0"),
-            ("BALANCED", "#00ff00"),
-            ("PERFORMANCE", "#ffaa00"),
-            ("TURBO", "#ff0000"),
-        ]
-        
-        for name, color_hex in modes:
-            btn = QPushButton(f"● {name}")
-            btn.setStyleSheet(f"""
-                QPushButton {{
-                    background: rgba(15, 9, 19, 200);
-                    border: 1px solid rgba(255, 255, 255, 30);
-                    border-radius: 15px;
-                    color: #888888;
-                    font-family: 'Segoe UI';
-                    font-size: 11px;
-                    font-weight: bold;
-                    height: 35px;
-                }}
-                QPushButton:hover {{
-                    border: 1px solid {color_hex};
-                    color: white;
-                }}
-            """)
-            btn.clicked.connect(lambda checked, n=name, btn=btn: self.change_mode(n, btn))
-            bottom_bar.addWidget(btn)
-            self.mode_buttons.append((name, btn, color_hex))
-            
-        self.change_mode("TURBO", self.mode_buttons[3][1])
-        
-        main_layout.addLayout(bottom_bar)
 
-    def change_mode(self, mode_name, button):
-        for name, btn, col in self.mode_buttons:
-            btn.setStyleSheet(f"""
-                QPushButton {{
-                    background: rgba(15, 9, 19, 200);
-                    border: 1px solid rgba(255, 255, 255, 30);
-                    border-radius: 15px;
-                    color: #888888;
-                    font-family: 'Segoe UI';
-                    font-size: 11px;
-                    font-weight: bold;
-                    height: 35px;
-                }}
-                QPushButton:hover {{
-                    border: 1px solid {col};
-                    color: white;
-                }}
-            """)
-            
-        selected_col = next(col for name, btn, col in self.mode_buttons if name == mode_name)
-        button.setStyleSheet(f"""
-            QPushButton {{
-                background: rgba(255, 0, 0, 20);
-                border: 2px solid {selected_col};
-                border-radius: 15px;
-                color: #ffffff;
-                font-family: 'Segoe UI';
-                font-size: 11px;
-                font-weight: bold;
-                height: 35px;
-            }}
-        """)
-        print(f"🚀 Performance mode changed to: {mode_name}")
-        if mode_name == "TURBO":
-            self.status_title_lbl.setText("• TURBO - MAXIMUM OVERDRIVE")
-        else:
-            self.status_title_lbl.setText(f"• MODE: {mode_name}")
 
     def update_clock(self):
         self.clock_lbl.setText(datetime.now().strftime("%H:%M:%S"))

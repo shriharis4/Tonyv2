@@ -31,3 +31,8 @@ Thumbs.db
 build/
 dist/
 *.spec
+
+# Documents
+*.pdf
+*.ppt
+*.pptx

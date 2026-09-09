@@ -259,56 +259,27 @@ def update_gui_partial_transcript(text: str, is_final: bool):
         _partial_transcript_open = False
 
 # -----------------------------------------------------------------------
-# SAPI INTERRUPTION
-# -----------------------------------------------------------------------
-def _interrupt_sapi():
-    """Stop SAPI speech immediately when user starts talking."""
-    global is_speaking_locally
-    if not is_speaking_locally:
-        return
-    print("[INTERRUPT] Stopping SAPI — user started speaking")
-    is_speaking_locally = False  # Signal speak_local_background to exit
-
-    def do_stop():
-        try:
-            import pythoncom
-            import win32com.client
-            pythoncom.CoInitialize()
-            # Dispatching a fresh SAPI instance and purging is the fastest way
-            spv = win32com.client.Dispatch("SAPI.SpVoice")
-            spv.Speak("", 3)   # SVSFlagsAsync(1) | SVSFPurgeBeforeSpeak(2) = 3
-        except Exception as e:
-            print(f"[INTERRUPT] SAPI stop error: {e}")
-        finally:
-            try:
-                import pythoncom
-                pythoncom.CoUninitialize()
-            except Exception:
-                pass
-
-    t = threading.Thread(target=do_stop, daemon=True)
-    t.start()
 
 # -----------------------------------------------------------------------
 # STREAMING RESPONSE — word-by-word push to GUI
 # -----------------------------------------------------------------------
 import threading
+import asyncio
 _stream_lock = threading.Lock()
-_current_stream_timer: list = []  # holds pending timers so they can be cancelled
+_current_stream_task = None
 
 def _cancel_pending_stream():
-    """Cancel any in-flight streaming timers from previous response."""
-    with _stream_lock:
-        for t in _current_stream_timer:
-            t.cancel()
-        _current_stream_timer.clear()
+    """Cancel any in-flight streaming task from previous response."""
+    global _current_stream_task
+    if _current_stream_task is not None and not _current_stream_task.done():
+        _current_stream_task.cancel()
+    _current_stream_task = None
 
 def update_gui_response(response: str):
     """Stream the response word-by-word to the GUI chat bubble."""
     if not response or not response.strip():
         return
 
-    # Cancel any previously streaming response
     _cancel_pending_stream()
 
     has_streaming = (
@@ -332,7 +303,7 @@ def update_gui_response(response: str):
     # Split into small chunks (2-3 words each) for a live-typing feel
     words = response.split()
     CHUNK_SIZE = 3          # words per chunk
-    DELAY_MS = 0.025        # 25ms between chunks — fast display
+    DELAY_S = 0.025        # 25ms between chunks
 
     chunks = []
     for i in range(0, len(words), CHUNK_SIZE):
@@ -342,26 +313,26 @@ def update_gui_response(response: str):
             chunk += ' '
         chunks.append(chunk)
 
-    with _stream_lock:
+    async def _stream_coro():
         for idx, chunk in enumerate(chunks):
-            delay = idx * DELAY_MS
             is_last = (idx == len(chunks) - 1)
+            try:
+                if _gui_callbacks.get('stream_chunk'):
+                    _gui_callbacks['stream_chunk'](chunk)
+                if is_last and _gui_callbacks.get('stream_end'):
+                    _gui_callbacks['stream_end']()
+            except Exception as e:
+                print(f"[STREAM] chunk send error: {e}")
+                break
+            if not is_last:
+                await asyncio.sleep(DELAY_S)
 
-            def make_sender(c, last):
-                def send():
-                    try:
-                        if _gui_callbacks.get('stream_chunk'):
-                            _gui_callbacks['stream_chunk'](c)
-                        if last and _gui_callbacks.get('stream_end'):
-                            _gui_callbacks['stream_end']()
-                    except Exception as e:
-                        print(f"[STREAM] chunk send error: {e}")
-                return send
-
-            t = threading.Timer(delay, make_sender(chunk, is_last))
-            t.daemon = True
-            t.start()
-            _current_stream_timer.append(t)
+    global _current_stream_task
+    try:
+        loop = asyncio.get_running_loop()
+        _current_stream_task = loop.create_task(_stream_coro())
+    except RuntimeError:
+        pass
 
 def update_gui_connection(status_str: str):
     if _gui_callbacks['update_connection']:
@@ -524,7 +495,6 @@ turn_ctx = TurnContext()
 active_timeout_task = None
 is_speaking_locally = False
 last_local_speech_end = 0.0
-sapi_lock = asyncio.Lock()
 
 def _normalize_command(text: str) -> str:
     if not text:
@@ -560,7 +530,7 @@ def _abort_model_turn(session: AgentSession) -> None:
 
 def _finish_direct_turn(session: AgentSession) -> None:
     global turn_ctx
-    _abort_model_turn(session)
+    # session already aborted before routing started. No redundant call.
     turn_ctx.is_active = True  # Keep assistant active so follow-up commands are never dropped
     turn_ctx.state = "IDLE"
     
@@ -594,63 +564,29 @@ async def speak_local(session: AgentSession, text: str):
     timer.t9 = time.perf_counter()
     print(f"[T9] response started: '{text}'")
     
-    # Start SAPI speaking in the background without blocking the router turn!
+    # Start cloud speaking in the background without blocking the router turn!
     asyncio.create_task(speak_local_background(session, text))
 
 async def speak_local_background(session: AgentSession, text: str):
     global is_speaking_locally
-    print("[TTS] response started")
+    print("[TTS] response started using Google API / LiveKit")
     print("[AUDIO OUT] audio playback started")
-    async with sapi_lock:
-        success = False
-        try:
-            def run_speak():
-                import pythoncom
-                import win32com.client
-                try:
-                    pythoncom.CoInitialize()
-                    speaker = win32com.client.Dispatch("SAPI.SpVoice")
-                    try:
-                        for v in speaker.GetVoices():
-                            desc = v.GetDescription().lower()
-                            if "zira" in desc or "female" in desc:
-                                speaker.Voice = v
-                                break
-                    except Exception:
-                        pass
-                    speaker.Speak(text, 2) # SVSFPurgeBeforeSpeak (Synchronous)
-                    return True
-                except Exception as e:
-                    print(f"⚠️ SAPI thread speak failed: {e}")
-                    return False
-                finally:
-                    try:
-                        pythoncom.CoUninitialize()
-                    except:
-                        pass
-            success = await asyncio.get_running_loop().run_in_executor(None, run_speak)
-        except Exception as e:
-            print(f"⚠️ SAPI speak task error: {e}")
-            
-        if not success:
-            print("Falling back to LiveKit speech.")
-            try:
-                # NOTE: is_speaking_locally is still True here, so conversation_item_added
-                # will skip rendering a duplicate bubble for this session.say() call.
-                await session.say(text)
-            except Exception as se:
-                print(f"⚠️ LiveKit fallback speech failed: {se}")
+    
+    try:
+        await session.say(text)
+    except Exception as e:
+        print(f"⚠️ Cloud speech failed: {e}")
                 
-        is_speaking_locally = False
-        global last_local_speech_end
-        last_local_speech_end = time.perf_counter()
-        print("[TTS] response finished")
-        print("[AUDIO OUT] audio playback finished")
-        timer = get_or_create_timer()
-        timer.t10 = time.perf_counter()
-        print("[T10] response completed")
-        timer.print_perf()
-        update_gui_status("Listening...")
+    is_speaking_locally = False
+    global last_local_speech_end
+    last_local_speech_end = time.perf_counter()
+    print("[TTS] response finished")
+    print("[AUDIO OUT] audio playback finished")
+    timer = get_or_create_timer()
+    timer.t10 = time.perf_counter()
+    print("[T10] response completed")
+    timer.print_perf()
+    update_gui_status("Listening...")
 
 # Context for desktop actions
 active_session = None
@@ -777,7 +713,7 @@ async def route_command_directly(session: AgentSession, command: str) -> bool:
                                 if not ready:
                                     print(f"[ROUTER] wait_for_process timed out for '{proc_name}', proceeding.")
                             else:
-                                await asyncio.sleep(0.25) # Fallback if target unknown
+                                pass # Wait removed for latency. Process check was sufficient.
                     else:
                         print(f"[ROUTER] Step {i+1} failed to route directly. Falling back to Gemini.")
                         return False
@@ -1375,25 +1311,8 @@ def find_and_open_file(name_query, file_type="pdf"):
         os.getcwd()
     ]
     # Check active explorer path
-    try:
-        ps_script = """
-        $shell = New-Object -ComObject Shell.Application
-        $windows = $shell.Windows()
-        foreach ($window in $windows) {
-            if ($window.FullName -like "*explorer.exe*") {
-                $path = $window.Document.Folder.Self.Path
-                if ($path) { return $path }
-            }
-        }
-        """
-        import subprocess
-        res = subprocess.run(['powershell', '-Command', ps_script], capture_output=True, text=True, timeout=2)
-        if res.returncode == 0 and res.stdout.strip():
-            explorer_path = res.stdout.strip()
-            if os.path.exists(explorer_path) and explorer_path not in dirs:
-                dirs.insert(0, explorer_path)
-    except:
-        pass
+    # Removed slow PowerShell COM inspection to reduce latency.
+    # We now strictly search standard user directories directly.
         
     for d in dirs:
         if not os.path.exists(d):
@@ -1439,15 +1358,17 @@ def reset_active_timeout(session):
     if active_timeout_task:
         active_timeout_task.cancel()
     
-    async def timeout_coro():
+    current_turn_id = turn_ctx.turn_id
+    async def timeout_coro(turn_id):
         await asyncio.sleep(8)
         global turn_ctx
-        if turn_ctx.is_active:
+        # Only deactivate if the turn hasn't changed
+        if turn_ctx.is_active and turn_ctx.turn_id == turn_id:
             print("[ROUTER] Active listening timeout. Deactivating...")
             turn_ctx.is_active = False
             update_gui_status("Listening...")
             
-    active_timeout_task = asyncio.create_task(timeout_coro())
+    active_timeout_task = asyncio.create_task(timeout_coro(current_turn_id))
 
 async def handle_user_transcript(session: AgentSession, transcript: str):
     global turn_ctx, active_timeout_task
@@ -1467,9 +1388,9 @@ async def handle_user_transcript(session: AgentSession, transcript: str):
         
 
     if turn_ctx.state != 'IDLE':
-        print("[ROUTER] ignored — turn already in progress")
+        print(f"[ROUTER] PREEMPTING previous turn ({turn_ctx.state}) for new command: {clean_text}")
         _abort_model_turn(session)
-        return
+        # We don't return here! We allow the new command to become the active turn.
 
     # --- EXACT DUPLICATE suppression (same transcript within 6s) ---
     if clean_text and clean_text == turn_ctx.last_handled_transcript and (now - turn_ctx.last_handled_at) < 3.0:
@@ -1805,7 +1726,10 @@ async def entrypoint(ctx: agents.JobContext):
             update_gui_status("Speech Detected")
             # INTERRUPTION: If TONY is currently speaking, stop it
             if is_speaking_locally:
-                _interrupt_sapi()
+                try:
+                    session.interrupt(force=True)
+                except Exception:
+                    pass
         elif ev.new_state == "idle":
             timer.t2 = time.perf_counter()
             print("[T2] speech ended")
@@ -1870,9 +1794,9 @@ async def entrypoint(ctx: agents.JobContext):
     def on_convo_item(ev: agents.voice.ConversationItemAddedEvent):
         nonlocal _last_convo_text, _last_convo_time
         if hasattr(ev.item, "role") and ev.item.role == "assistant":
-            # Skip if direct router is currently speaking via SAPI
+            # Skip GUI updates for direct router's session.say() to avoid duplicate text bubbles
             if is_speaking_locally:
-                print("[CONVO] Skipped — direct router is speaking locally")
+                print("[CONVO] Skipped GUI update — direct router already rendered text")
                 return
 
             # Extract content from ChatMessage
