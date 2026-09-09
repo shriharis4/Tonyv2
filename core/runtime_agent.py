@@ -332,7 +332,7 @@ def update_gui_response(response: str):
     # Split into small chunks (2-3 words each) for a live-typing feel
     words = response.split()
     CHUNK_SIZE = 3          # words per chunk
-    DELAY_MS = 0.055        # 55ms between chunks — ~300 wpm feel
+    DELAY_MS = 0.025        # 25ms between chunks — fast display
 
     chunks = []
     for i in range(0, len(words), CHUNK_SIZE):
@@ -574,7 +574,7 @@ def _is_repeated_command(clean_text: str, now: float) -> bool:
     current_key = _normalize_command(clean_text)
     if not current_key:
         return True
-    if current_key == turn_ctx.last_processed_command and (now - turn_ctx.last_processed_at) < 8.0:
+    if current_key == turn_ctx.last_processed_command and (now - turn_ctx.last_processed_at) < 4.0:
         print("[ROUTER] ignored — repeated command within cooldown")
         return True
     turn_ctx.last_processed_command = current_key
@@ -635,6 +635,8 @@ async def speak_local_background(session: AgentSession, text: str):
         if not success:
             print("Falling back to LiveKit speech.")
             try:
+                # NOTE: is_speaking_locally is still True here, so conversation_item_added
+                # will skip rendering a duplicate bubble for this session.say() call.
                 await session.say(text)
             except Exception as se:
                 print(f"⚠️ LiveKit fallback speech failed: {se}")
@@ -1470,7 +1472,7 @@ async def handle_user_transcript(session: AgentSession, transcript: str):
         return
 
     # --- EXACT DUPLICATE suppression (same transcript within 6s) ---
-    if clean_text and clean_text == turn_ctx.last_handled_transcript and (now - turn_ctx.last_handled_at) < 6.0:
+    if clean_text and clean_text == turn_ctx.last_handled_transcript and (now - turn_ctx.last_handled_at) < 3.0:
         print("[ROUTER] ignored — duplicate transcript of completed task")
         _abort_model_turn(session)
         return
@@ -1480,7 +1482,7 @@ async def handle_user_transcript(session: AgentSession, transcript: str):
     # commands like "play" if Tony had said "playing music on spotify".
     # Now uses SequenceMatcher ratio >= 0.85 (near-exact match only) with
     # a tighter 4s window instead of 8s.
-    if turn_ctx.last_spoken_text and clean_text and (now - turn_ctx.last_handled_at) < 4.0:
+    if turn_ctx.last_spoken_text and clean_text and (now - turn_ctx.last_handled_at) < 2.0:
         echo_ratio = difflib.SequenceMatcher(None, clean_text, turn_ctx.last_spoken_text).ratio()
         if echo_ratio >= 0.85:
             print(f"[ROUTER] ignored — echo of Tony's last spoken line (similarity={echo_ratio:.2f})")
@@ -1522,20 +1524,17 @@ async def handle_user_transcript(session: AgentSession, transcript: str):
         turn_ctx.last_handled_at = time.perf_counter()
         _finish_direct_turn(session)
     else:
-        print(f"[ROUTER] Direct routing failed, generating reply via LLM for: '{clean_text}'")
+        # Let Gemini RealtimeModel handle it natively from the audio stream.
+        # DO NOT call session.generate_reply() here — Gemini is already processing
+        # the user's audio and will auto-generate a response. Calling generate_reply
+        # would create a DUPLICATE second response bubble.
+        print(f"[ROUTER] Direct routing failed, deferring to Gemini native audio for: '{clean_text}'")
         turn_ctx.state = "LLM_EXECUTION"
         update_gui_status("Processing...")
         timer.t5 = time.perf_counter()
-        print("[T5] LLM request started (fallback from direct router)")
-        try:
-            # Explicitly instruct the LiveKit session model to generate a response
-            await session.generate_reply(
-                instructions=f"The user said: '{transcript}'. Respond concisely, directly and helpfully."
-            )
-        except Exception as e:
-            print(f"[LLM] Error in generate_reply: {e}")
-            await speak_local(session, "I heard you, but I couldn't process that command.")
-            _finish_direct_turn(session)
+        print("[T5] Gemini native audio processing (no duplicate generate_reply)")
+        turn_ctx.last_handled_transcript = clean_text
+        turn_ctx.last_handled_at = time.perf_counter()
 
 _global_llm = None
 
@@ -1547,8 +1546,8 @@ def _init_global_llm():
             _global_llm = RealtimeModel(
                 model="gemini-2.5-flash-native-audio-preview-12-2025",
                 voice="Aoede",  # Female voice
-                temperature=0.9,
-                max_output_tokens=1024,
+                temperature=0.7,
+                max_output_tokens=512,
             )
         else:
             raise ValueError(f"RealtimeModel not available. Import error: {import_error}")
@@ -1588,12 +1587,12 @@ class UltimateAdvancedTony(Agent):
             tools=wrapped_tools,
             llm=self._init_llm(),
             min_endpointing_delay=0.05,
-            max_endpointing_delay=0.30,
+            max_endpointing_delay=0.15,
             vad=silero.VAD.load(
                 activation_threshold=0.3,
                 deactivation_threshold=0.25,
                 min_speech_duration=0.03,
-                min_silence_duration=0.35
+                min_silence_duration=0.20
             ),
         )
 
@@ -1762,6 +1761,8 @@ class UltimateAdvancedTony(Agent):
 # =========================
 # ENTRYPOINT
 # =========================
+_greeting_sent = False
+
 async def entrypoint(ctx: agents.JobContext):
     # Ignore handshake-room job assignments
     if ctx.room.name == "handshake-room":
@@ -1804,7 +1805,7 @@ async def entrypoint(ctx: agents.JobContext):
     @session.on("user_input_transcribed")
     def on_user_transcript(ev: agents.voice.UserInputTranscribedEvent):
         global is_speaking_locally, last_local_speech_end
-        if is_speaking_locally or (time.perf_counter() - last_local_speech_end < 1.5):
+        if is_speaking_locally or (time.perf_counter() - last_local_speech_end < 0.5):
             return
         if ev.transcript.strip():
             # Stream partial/final transcript into a single bubble
@@ -1852,9 +1853,18 @@ async def entrypoint(ctx: agents.JobContext):
             timer.t10 = time.perf_counter()
             print("[T10] response completed")
             timer.print_perf()
+    _last_convo_text = ""
+    _last_convo_time = 0.0
+
     @session.on("conversation_item_added")
     def on_convo_item(ev: agents.voice.ConversationItemAddedEvent):
+        nonlocal _last_convo_text, _last_convo_time
         if hasattr(ev.item, "role") and ev.item.role == "assistant":
+            # Skip if direct router is currently speaking via SAPI
+            if is_speaking_locally:
+                print("[CONVO] Skipped — direct router is speaking locally")
+                return
+
             # Extract content from ChatMessage
             text = ""
             if hasattr(ev.item, "content"):
@@ -1871,12 +1881,19 @@ async def entrypoint(ctx: agents.JobContext):
                         elif isinstance(block, dict) and "text" in block:
                             texts.append(block["text"])
                     text = " ".join(texts)
+
             if text:
+                # Dedup: skip if same text rendered within 3 seconds
+                now = time.perf_counter()
+                if text.strip() == _last_convo_text.strip() and (now - _last_convo_time) < 3.0:
+                    print(f"[CONVO] Skipped duplicate bubble: '{text[:40]}...'")
+                    return
+                _last_convo_text = text
+                _last_convo_time = now
                 update_gui_response(text)
+
             global turn_ctx
             turn_ctx.state = "IDLE"
-            
-            
 
     @session.on("close")
     def on_session_close(ev: agents.voice.CloseEvent):
@@ -1912,7 +1929,10 @@ async def entrypoint(ctx: agents.JobContext):
         # Start session health monitor for 2-hour sessions
         asyncio.create_task(_session_health_monitor())
 
-        await session.generate_reply(instructions=SESSION_INSTRUCTION)
+        global _greeting_sent
+        if not _greeting_sent:
+            _greeting_sent = True
+            await session.generate_reply(instructions=SESSION_INSTRUCTION)
         print("[INFO] Tony is LIVE & READY")
     except Exception as conn_err:
         print(f"[ERROR] LiveKit session start failed: {conn_err}")
