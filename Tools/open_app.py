@@ -67,7 +67,8 @@ async def open_app(app_name: str) -> str:
         if not launched:
             try:
                 ps_cmd = f'Get-StartApps | Where-Object {{ $_.Name -like "*{name}*" }} | Select-Object -ExpandProperty AppID -First 1'
-                result = subprocess.run(["powershell", "-Command", ps_cmd], capture_output=True, text=True, timeout=2)
+                loop = asyncio.get_running_loop()
+                result = await loop.run_in_executor(None, lambda: subprocess.run(["powershell", "-Command", ps_cmd], capture_output=True, text=True, timeout=2))
                 if result.returncode == 0:
                     appid = result.stdout.strip()
                     if appid:

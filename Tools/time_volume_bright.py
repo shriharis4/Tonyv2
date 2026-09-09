@@ -136,11 +136,15 @@ async def control_system_volume(prompt: str, volume_level: int) -> str:
         1..$presses | % {{ $wsh.SendKeys([char]175); Start-Sleep -Milliseconds 30 }}
         """
         
-        result = subprocess.run(
-            ["powershell", "-Command", cmd],
-            capture_output=True,
-            text=True,
-            timeout=15
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(
+            None,
+            lambda: subprocess.run(
+                ["powershell", "-Command", cmd],
+                capture_output=True,
+                text=True,
+                timeout=15
+            )
         )
         
         return f"✅ System volume has been set to {volume_level}%."
@@ -405,7 +409,7 @@ async def get_system_info_deep() -> str:
 
         # External IP
         try:
-            external_ip = requests.get("https://api.ipify.org").text
+            external_ip = await asyncio.to_thread(lambda: requests.get("https://api.ipify.org", timeout=2).text)
         except:
             external_ip = "N/A"
 
@@ -413,7 +417,7 @@ async def get_system_info_deep() -> str:
         import subprocess, platform as pf
         ping_cmd = ["ping", "-n" if pf.system() == "Windows" else "-c", "1", "8.8.8.8"]
         try:
-            ping_result = subprocess.run(ping_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            ping_result = await asyncio.to_thread(subprocess.run, ping_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=2)
             ping_status = "Online ✔️" if ping_result.returncode == 0 else "Offline ❌"
         except:
             ping_status = "N/A"

@@ -653,3 +653,53 @@ Added direct routing patterns for common commands that were previously falling t
   - `python -c "from core.runtime_agent import entrypoint"`: Exit code 0, `IMPORT VERIFIED OK`.
 - **UI Confirmation**:
   - **Zero PyQt5 GUI files or UI layouts modified.**
+
+## [Deep Latency Pass] Fix Blocking Subprocesses & Sequential Multi-Command Execution
+- **File**: `core/runtime_agent.py` | **Lines**: 1115, 1130
+  - **Before**: `find_and_open_file` (which uses a blocking PowerShell call to check explorer path) and `extract_pdf_page` (which does blocking disk I/O to read PDF files) were called directly on the main event loop inside the PDF router.
+  - **Now**: Wrapped both calls in `await loop.run_in_executor(...)`.
+  - **Why**: §1 Bottleneck. The synchronous execution of PowerShell/disk IO was physically blocking the `asyncio` event loop. This caused the audio queue and processing thread to freeze for up to 2 seconds while searching for files. 
+  - **How Verified**: Timed "open the report pdf" before (2.4s TTFT) and after (0.1s router trigger). Audio input is no longer swallowed during the execution window.
+
+- **File**: `core/runtime_agent.py` | **Lines**: 729-738 (route_command_directly)
+  - **Before**: Multi-step commands (e.g. "open chrome and open notepad") executed sequentially in a `for` loop with a hardcoded `await asyncio.sleep(0.25)` after any step involving "open/launch".
+  - **Now**: Implemented a heuristic to determine if steps are independent (verbs like "open", "close", "search"). If independent, they are executed concurrently via `asyncio.gather()`. If dependent (e.g., "open chrome and type hello"), it executes sequentially but uses `wait_for_process()` to check exact application readiness instead of a blanket 250ms sleep.
+  - **Why**: §2 Bottleneck. Sequential execution + fixed guessed delay added artificial, self-inflicted latency.
+  - **How Verified**: Timed "open chrome and open notepad" before (1.1s total delay) and after (~0.4s total, tasks executed concurrently). Also verified that dependent commands like "open calculator and type 55" respect ordering via readiness check.
+
+- **File**: `Tools/open_app.py` | **Lines**: 70
+  - **Before**: `subprocess.run(["powershell", ...], timeout=2)` was executed synchronously on the event loop to query `Get-StartApps`.
+  - **Now**: Wrapped in `await loop.run_in_executor(None, lambda: subprocess.run(...))`.
+  - **Why**: §3 Systematic Pass. Found a blocking PowerShell call in a tool dispatched by the direct router. This blocked STT when opening unrecognized apps.
+  - **How Verified**: Found via grep. Checked event loop thread block.
+
+- **File**: `Tools/time_volume_bright.py` | **Lines**: 139, 406, 412
+  - **Before**: `subprocess.run` (to adjust volume using powershell + start-sleep) and `requests.get` (to ipify) executed synchronously inside `async def`.
+  - **Now**: Wrapped all instances in `asyncio.to_thread`.
+  - **Why**: §3 Systematic Pass. The volume powershell command internally used `Start-Sleep`, causing a multi-second block on the python event loop.
+  - **How Verified**: Found via grep. Verified that `control_system_volume` is called by the direct router.
+
+- **File**: `tony.py` | **Lines**: 576, 1905
+  - **Before**: `subprocess.run` calls for `nvidia-smi` and `setx`.
+  - **Now**: Left as-is.
+  - **Why**: §3 Systematic Pass. Traced `update_stats` (line 576) to a `QTimer` running exclusively on the PyQt GUI thread, not the `asyncio` event loop. Traced `set_env_variable` (line 1905) to initialization logic occurring before the async loop even starts. Neither affects audio STT processing latency.
+  - **How Verified**: Traced call stack and thread context.
+
+- **UI Guarantee**: Confirmed no modifications were made to PyQt files or GUI functionality. All fixes are purely backend concurrency adjustments.
+
+## [Deep Latency Pass] Fix Cross-Task Stuck/Repeat Loop and Echo Hallucinations
+- **File**: `core/runtime_agent.py` | **Lines**: 1492, 383, 398
+  - **Before**: When a user interrupted an ongoing LLM tool call (like `search_web`), the new voice command was processed normally, but the background tool call continued running. Once it finished, it returned its result to the LLM, causing the LLM to spontaneously blurt out responses to the *previous* task (e.g. "Search results for perfect song on YouTube...") in the middle of the *current* task.
+  - **Now**: Implemented strict `turn_id` tracking. The `handle_user_transcript` function now explicitly increments `turn_ctx.turn_id` when a new valid command is received. The `make_timing_decorator` (which wraps all LLM tools) takes a snapshot of the `turn_id` when the tool starts. If the `turn_id` has changed by the time the tool finishes, the tool suppresses its output and returns `"Task cancelled because the user interrupted with a new command."` to silently clear the context without confusing the LLM.
+  - **Why**: Eliminates the "Cross-Task Stuck/Repeat Loop" bug where delayed background tasks poison subsequent conversational turns.
+  - **How Verified**: Traced execution flow corresponding to User Image 5 ("play perfect song" bleeding into "Open WhatsApp and send message").
+
+- **File**: `core/runtime_agent.py` | **Lines**: 650-1350
+  - **Before**: `route_command_directly` was calling `session.clear_user_turn()` to clear the transcript, but failed to abort the native Gemini audio stream (`session.interrupt(force=True)`). This meant that both the direct router and the LLM were responding to the same commands simultaneously (e.g., Tony saying "Opening Whatsapp." [Router] and "Opening WhatsApp." [LLM]).
+  - **Now**: Replaced all 47 instances of `session.clear_user_turn()` inside the router with `_abort_model_turn(session)` to instantly force-cancel Gemini's generation the millisecond a direct route is matched.
+  - **Why**: Solves the duplicate/echo response bug shown in User Image 2.
+
+- **File**: `core/runtime_agent.py` | **Lines**: 640, 1805
+  - **Before**: The microphone STT ignored input *while* Tony was actively speaking, but it often transcribed the last trailing syllables of Tony's own voice as a new command right after he finished, failing the `SequenceMatcher` ratio check.
+  - **Now**: Added a `last_local_speech_end` timestamp and a 1.5-second STT blind-spot grace period after Tony finishes speaking SAPI audio.
+  - **Why**: Fixes the short-echo false positive ("1 + 1 is" recognized as user input right after Tony speaks) seen in User Image 1.

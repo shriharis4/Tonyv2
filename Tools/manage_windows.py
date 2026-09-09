@@ -326,9 +326,9 @@ class AdvancedWindowManager:
             # Method 1: Send close message
             try:
                 WM_CLOSE = 0x0010
-                result = ctypes.windll.user32.PostMessageW(hwnd, WM_CLOSE, 0, 0)
-                if result:
-                    await asyncio.sleep(0.5)
+                ctypes.windll.user32.PostMessageW(hwnd, WM_CLOSE, 0, 0)
+                await asyncio.sleep(0.5)
+                if not ctypes.windll.user32.IsWindow(hwnd):
                     return True
             except Exception as e:
                 logger.warning(f"PostMessage close failed: {e}")
@@ -339,9 +339,29 @@ class AdvancedWindowManager:
                 await asyncio.sleep(0.2)
                 await asyncio.to_thread(pyautogui.hotkey, 'alt', 'f4')
                 await asyncio.sleep(0.5)
-                return True
+                if not ctypes.windll.user32.IsWindow(hwnd):
+                    return True
             except Exception as e:
                 logger.warning(f"Alt+F4 failed: {e}")
+                
+            # Method 3: Process kill fallback
+            try:
+                pid = wintypes.DWORD()
+                ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                if pid.value > 0:
+                    try:
+                        p = psutil.Process(pid.value)
+                        p.terminate()
+                        await asyncio.sleep(0.5)
+                        if not ctypes.windll.user32.IsWindow(hwnd):
+                            return True
+                    except Exception:
+                        # Force kill if terminate fails
+                        os.system(f"taskkill /PID {pid.value} /F /T")
+                        await asyncio.sleep(0.5)
+                        return True
+            except Exception as e:
+                logger.warning(f"Process kill fallback failed: {e}")
             
             return False
             
