@@ -44,7 +44,7 @@ async def open_spotify() -> str:
 
 @function_tool()
 async def spotify_play() -> str:
-    """Play or resume Spotify music"""
+    """ONLY use this to resume paused Spotify music. DO NOT use this to play a specific song or search."""
     try:
         # Check if Spotify is open (loose match)
         spotify_windows = [w for w in gw.getAllWindows() if 'spotify' in w.title.lower()]
@@ -132,45 +132,32 @@ async def spotify_previous() -> str:
 
 @function_tool()
 async def spotify_play_song(song_name: str) -> str:
-    """Search and play a specific song on Spotify"""
+    """Search and play a specific song on Spotify by its name."""
     try:
-        # Check if Spotify is open (loose match)
+        # Use Windows protocol to fast-search and launch Spotify if installed
+        import os
+        import urllib.parse
+        encoded_song = urllib.parse.quote(song_name)
+        os.startfile(f"spotify:search:{encoded_song}")
+        
+        time.sleep(2) # Wait for Spotify to handle the URI and render the search page
+        
+        # Get window to ensure it's in foreground
         spotify_windows = [w for w in gw.getAllWindows() if 'spotify' in w.title.lower()]
-        
-        if not spotify_windows:
-            # Open Spotify first
-            result = await open_spotify()
-            if "✅" not in result:
-                return result
-            time.sleep(3)
-            
-            # Get window again after opening
-            spotify_windows = [w for w in gw.getAllWindows() if 'spotify' in w.title.lower()]
-        
         if spotify_windows:
             spotify_windows[0].activate()
-            time.sleep(1)
-            
-            # Search for song (Ctrl + L)
-            pyautogui.hotkey('ctrl', 'l')
             time.sleep(0.5)
             
-            # Clear and type song name
-            pyautogui.hotkey('ctrl', 'a')
-            pyautogui.press('delete')
-            pyautogui.write(song_name, interval=0.05)
-            time.sleep(1)
-            
-            # Select first result
+            # Select first result and play
+            pyautogui.press('tab')
+            time.sleep(0.1)
             pyautogui.press('enter')
-            time.sleep(2)
-            
-            # Play the song
-            pyautogui.press('space')
+            time.sleep(0.5)
+            pyautogui.press('enter')
             
             return f"🎵 Playing: {song_name}"
         
-        return "❌ Could not open Spotify"
+        return "❌ Could not find Spotify window"
         
     except Exception as e:
         return f"❌ Error: {str(e)}"

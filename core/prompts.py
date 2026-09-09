@@ -220,7 +220,9 @@ AGENT_INSTRUCTION_FOR_TOOLS = """
 9. `send_whatsapp_message(contact,msg)` - WhatsApp desktop automation
 
 ###  Media Tools
-10. `play_media(name,type)` - Play YouTube videos/songs
+10. `play_media(name,type)` - Play a specific song or video on YouTube
+11. `spotify_play_song(song_name)` - Play a specific song on Spotify
+12. `spotify_play()` - Resume paused Spotify music (ONLY use to resume, not to search)
 
 ###  Productivity
 11. `write_in_notepad(title,content)` - Create formatted documents

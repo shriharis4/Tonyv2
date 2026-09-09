@@ -68,7 +68,7 @@ logging.getLogger('asyncio').setLevel(logging.WARNING)
 PROGRESSBAR_STYLESHEET = """
     QProgressBar {{
         background: rgba(255, 255, 255, 15);
-        border: 1px solid rgba(255, 0, 127, 50);
+        border: 1px solid rgba(255, 0, 0, 50);
         border-radius: 4px;
         height: 6px;
     }}
@@ -78,11 +78,11 @@ PROGRESSBAR_STYLESHEET = """
     }}
 """
 
-LABEL_TITLE_STYLE = "color: #ff007f; font-family: 'Segoe UI'; font-size: 14px; font-weight: bold; letter-spacing: 1.5px;"
-LABEL_SECTION_STYLE = "color: #ff007f; font-family: 'Segoe UI'; font-size: 10px; font-weight: bold;"
-LABEL_STATUS_STYLE = "color: #ff007f; font-family: 'Segoe UI'; font-size: 9px; font-weight: bold;"
+LABEL_TITLE_STYLE = "color: #ff0000; font-family: 'Segoe UI'; font-size: 14px; font-weight: bold; letter-spacing: 1.5px;"
+LABEL_SECTION_STYLE = "color: #ff0000; font-family: 'Segoe UI'; font-size: 10px; font-weight: bold;"
+LABEL_STATUS_STYLE = "color: #ff0000; font-family: 'Segoe UI'; font-size: 9px; font-weight: bold;"
 LABEL_VALUE_STYLE = "color: #ffffff; font-family: 'Courier New'; font-size: 10px; font-weight: bold;"
-DIVIDER_LINE_STYLE = "color: rgba(255, 0, 127, 80); background: rgba(255, 0, 127, 80); height: 1px;"
+DIVIDER_LINE_STYLE = "color: rgba(255, 0, 0, 80); background: rgba(255, 0, 0, 80); height: 1px;"
 
 # Safe print wrapper to prevent UnicodeEncodeError on legacy Windows consoles
 _original_print = print
@@ -408,21 +408,21 @@ class VoiceVisualizer(QWidget):
         outer_radius = 65 + pulse_val
         
         gradient = QRadialGradient(cx, cy, outer_radius)
-        gradient.setColorAt(0, QColor(255, 0, 127, 40))
-        gradient.setColorAt(0.7, QColor(255, 0, 127, 15))
-        gradient.setColorAt(1, QColor(255, 0, 127, 0))
+        gradient.setColorAt(0, QColor(255, 0, 0, 40))
+        gradient.setColorAt(0.7, QColor(255, 0, 0, 15))
+        gradient.setColorAt(1, QColor(255, 0, 0, 0))
         painter.setBrush(QBrush(gradient))
         painter.setPen(Qt.NoPen)
         painter.drawEllipse(QPointF(cx, cy), outer_radius, outer_radius)
         
-        pen = QPen(QColor(255, 0, 127, 180))
+        pen = QPen(QColor(255, 0, 0, 180))
         pen.setWidth(2)
         painter.setPen(pen)
         painter.drawEllipse(QPointF(cx, cy), 60, 60)
         
         core_radius = 25 + pulse_val * 0.5
         core_gradient = QRadialGradient(cx, cy, core_radius)
-        core_gradient.setColorAt(0, QColor(255, 0, 127, 255))
+        core_gradient.setColorAt(0, QColor(255, 0, 0, 255))
         core_gradient.setColorAt(0.5, QColor(255, 0, 85, 180))
         core_gradient.setColorAt(1, QColor(15, 9, 19, 0))
         painter.setBrush(QBrush(core_gradient))
@@ -437,7 +437,7 @@ class VoiceVisualizer(QWidget):
             x2 = cx + (60 + length) * math.cos(angle)
             y2 = cy + (60 + length) * math.sin(angle)
             
-            pen = QPen(QColor(255, 0, 127, 200))
+            pen = QPen(QColor(255, 0, 0, 200))
             pen.setWidth(2)
             painter.setPen(pen)
             painter.drawLine(QPointF(x1, y1), QPointF(x2, y2))
@@ -465,12 +465,12 @@ class SystemMonitorWidget(QWidget):
         layout.setSpacing(8)
         
         title = QLabel("SYSTEM MONITOR")
-        title.setStyleSheet("color: #ff007f; font-family: 'Segoe UI'; font-size: 14px; font-weight: bold; letter-spacing: 1.5px;")
+        title.setStyleSheet("color: #ff0000; font-family: 'Segoe UI'; font-size: 14px; font-weight: bold; letter-spacing: 1.5px;")
         layout.addWidget(title)
         
         line = QFrame()
         line.setFrameShape(QFrame.HLine)
-        line.setStyleSheet("color: rgba(255, 0, 127, 80); background: rgba(255, 0, 127, 80); height: 1px;")
+        line.setStyleSheet("color: rgba(255, 0, 0, 80); background: rgba(255, 0, 0, 80); height: 1px;")
         layout.addWidget(line)
         
         gpu_detail_layout = QHBoxLayout()
@@ -484,12 +484,12 @@ class SystemMonitorWidget(QWidget):
         
         gpu_detail_widget = QWidget()
         gpu_detail_widget.setLayout(gpu_detail_layout)
-        gpu_detail_widget.setStyleSheet("background: rgba(255, 0, 127, 15); border: 1px solid rgba(255, 0, 127, 60); border-radius: 8px; padding: 5px;")
+        gpu_detail_widget.setStyleSheet("background: rgba(255, 0, 0, 15); border: 1px solid rgba(255, 0, 0, 60); border-radius: 8px; padding: 5px;")
         layout.addWidget(gpu_detail_widget)
         
         gpu_bar_title = QHBoxLayout()
         gpu_bar_lbl = QLabel("GPU USAGE")
-        gpu_bar_lbl.setStyleSheet("color: #ff007f; font-family: 'Segoe UI'; font-size: 10px; font-weight: bold;")
+        gpu_bar_lbl.setStyleSheet("color: #ff0000; font-family: 'Segoe UI'; font-size: 10px; font-weight: bold;")
         self.gpu_val_lbl = QLabel("0.0%")
         self.gpu_val_lbl.setStyleSheet("color: #ffffff; font-family: 'Courier New'; font-size: 10px; font-weight: bold;")
         gpu_bar_title.addWidget(gpu_bar_lbl)
@@ -503,12 +503,12 @@ class SystemMonitorWidget(QWidget):
         self.gpu_bar.setStyleSheet("""
             QProgressBar {
                 background: rgba(255, 255, 255, 15);
-                border: 1px solid rgba(255, 0, 127, 50);
+                border: 1px solid rgba(255, 0, 0, 50);
                 border-radius: 4px;
                 height: 8px;
             }
             QProgressBar::chunk {
-                background: #ff007f;
+                background: #ff0000;
                 border-radius: 4px;
             }
         """)
@@ -516,7 +516,7 @@ class SystemMonitorWidget(QWidget):
         
         cpu_bar_title = QHBoxLayout()
         cpu_bar_lbl = QLabel("CPU USAGE")
-        cpu_bar_lbl.setStyleSheet("color: #ff007f; font-family: 'Segoe UI'; font-size: 10px; font-weight: bold;")
+        cpu_bar_lbl.setStyleSheet("color: #ff0000; font-family: 'Segoe UI'; font-size: 10px; font-weight: bold;")
         self.cpu_val_lbl = QLabel("0.0%")
         self.cpu_val_lbl.setStyleSheet("color: #ffffff; font-family: 'Courier New'; font-size: 10px; font-weight: bold;")
         cpu_bar_title.addWidget(cpu_bar_lbl)
@@ -530,7 +530,7 @@ class SystemMonitorWidget(QWidget):
         self.cpu_bar.setStyleSheet("""
             QProgressBar {
                 background: rgba(255, 255, 255, 15);
-                border: 1px solid rgba(255, 0, 127, 50);
+                border: 1px solid rgba(255, 0, 0, 50);
                 border-radius: 4px;
                 height: 8px;
             }
@@ -543,7 +543,7 @@ class SystemMonitorWidget(QWidget):
         
         ram_bar_title = QHBoxLayout()
         ram_bar_lbl = QLabel("RAM USAGE")
-        ram_bar_lbl.setStyleSheet("color: #ff007f; font-family: 'Segoe UI'; font-size: 10px; font-weight: bold;")
+        ram_bar_lbl.setStyleSheet("color: #ff0000; font-family: 'Segoe UI'; font-size: 10px; font-weight: bold;")
         self.ram_val_lbl = QLabel("0.0%")
         self.ram_val_lbl.setStyleSheet("color: #ffffff; font-family: 'Courier New'; font-size: 10px; font-weight: bold;")
         ram_bar_title.addWidget(ram_bar_lbl)
@@ -557,7 +557,7 @@ class SystemMonitorWidget(QWidget):
         self.ram_bar.setStyleSheet("""
             QProgressBar {
                 background: rgba(255, 255, 255, 15);
-                border: 1px solid rgba(255, 0, 127, 50);
+                border: 1px solid rgba(255, 0, 0, 50);
                 border-radius: 4px;
                 height: 8px;
             }
@@ -620,12 +620,12 @@ class VoiceEngineWidget(QWidget):
         layout.setSpacing(6)
         
         title = QLabel("VOICE ENGINE")
-        title.setStyleSheet("color: #ff007f; font-family: 'Segoe UI'; font-size: 14px; font-weight: bold; letter-spacing: 1.5px;")
+        title.setStyleSheet("color: #ff0000; font-family: 'Segoe UI'; font-size: 14px; font-weight: bold; letter-spacing: 1.5px;")
         layout.addWidget(title)
         
         line = QFrame()
         line.setFrameShape(QFrame.HLine)
-        line.setStyleSheet("color: rgba(255, 0, 127, 80); background: rgba(255, 0, 127, 80); height: 1px;")
+        line.setStyleSheet("color: rgba(255, 0, 0, 80); background: rgba(255, 0, 0, 80); height: 1px;")
         layout.addWidget(line)
         
         self.visualizer = VoiceVisualizer()
@@ -640,7 +640,7 @@ class VoiceEngineWidget(QWidget):
             bar = QFrame()
             bar.setFixedWidth(3)
             bar.setFixedHeight(8)
-            bar.setStyleSheet("background: rgba(255, 0, 127, 100); border-radius: 1px;")
+            bar.setStyleSheet("background: rgba(255, 0, 0, 100); border-radius: 1px;")
             waveform_layout.addWidget(bar)
             self.waveform_bars.append(bar)
         waveform_layout.addStretch()
@@ -648,13 +648,13 @@ class VoiceEngineWidget(QWidget):
         layout.addSpacing(6)
 
         self.live_lbl = QLabel("● LIVE")
-        self.live_lbl.setStyleSheet("color: #ff007f; font-family: 'Segoe UI'; font-size: 9px; font-weight: bold;")
+        self.live_lbl.setStyleSheet("color: #ff0000; font-family: 'Segoe UI'; font-size: 9px; font-weight: bold;")
         self.live_lbl.setAlignment(Qt.AlignCenter)
         layout.addWidget(self.live_lbl)
         
         noise_title = QHBoxLayout()
         noise_lbl = QLabel("NOISE FLOOR")
-        noise_lbl.setStyleSheet("color: #ff007f; font-family: 'Segoe UI'; font-size: 10px; font-weight: bold;")
+        noise_lbl.setStyleSheet("color: #ff0000; font-family: 'Segoe UI'; font-size: 10px; font-weight: bold;")
         self.noise_val = QLabel("0.0 RMS")
         self.noise_val.setStyleSheet("color: #ffffff; font-family: 'Courier New'; font-size: 10px; font-weight: bold;")
         noise_title.addWidget(noise_lbl)
@@ -666,12 +666,12 @@ class VoiceEngineWidget(QWidget):
         self.noise_bar.setRange(0, 100)
         self.noise_bar.setValue(5)
         self.noise_bar.setTextVisible(False)
-        self.noise_bar.setStyleSheet(PROGRESSBAR_STYLESHEET.format(color="#ff007f"))
+        self.noise_bar.setStyleSheet(PROGRESSBAR_STYLESHEET.format(color="#ff0000"))
         layout.addWidget(self.noise_bar)
         
         boost_title = QHBoxLayout()
         boost_lbl = QLabel("MIC BOOST")
-        boost_lbl.setStyleSheet("color: #ff007f; font-family: 'Segoe UI'; font-size: 10px; font-weight: bold;")
+        boost_lbl.setStyleSheet("color: #ff0000; font-family: 'Segoe UI'; font-size: 10px; font-weight: bold;")
         self.boost_val = QLabel("1.2x")
         self.boost_val.setStyleSheet("color: #ffffff; font-family: 'Courier New'; font-size: 10px; font-weight: bold;")
         boost_title.addWidget(boost_lbl)
@@ -696,16 +696,16 @@ class VoiceEngineWidget(QWidget):
             if state in ["listening", "speaking"]:
                 h = random.randint(6, 18)
                 bar.setFixedHeight(h)
-                bar.setStyleSheet("background: #ff007f; border-radius: 1px;")
+                bar.setStyleSheet("background: #ff0000; border-radius: 1px;")
             else:
                 bar.setFixedHeight(8)
-                bar.setStyleSheet("background: rgba(255, 0, 127, 100); border-radius: 1px;")
+                bar.setStyleSheet("background: rgba(255, 0, 0, 100); border-radius: 1px;")
                 
     def set_state(self, state):
         self.visualizer.state = state
         if state == "listening":
             self.live_lbl.setText("● LISTENING")
-            self.live_lbl.setStyleSheet("color: #ff007f; font-family: 'Segoe UI'; font-size: 9px; font-weight: bold;")
+            self.live_lbl.setStyleSheet("color: #ff0000; font-family: 'Segoe UI'; font-size: 9px; font-weight: bold;")
         elif state == "speaking":
             self.live_lbl.setText("● SPEAKING")
             self.live_lbl.setStyleSheet("color: #00ffff; font-family: 'Segoe UI'; font-size: 9px; font-weight: bold;")
@@ -714,7 +714,7 @@ class VoiceEngineWidget(QWidget):
             self.live_lbl.setStyleSheet("color: #ffff00; font-family: 'Segoe UI'; font-size: 9px; font-weight: bold;")
         else:
             self.live_lbl.setText("● LIVE")
-            self.live_lbl.setStyleSheet("color: #ff007f; font-family: 'Segoe UI'; font-size: 9px; font-weight: bold;")
+            self.live_lbl.setStyleSheet("color: #ff0000; font-family: 'Segoe UI'; font-size: 9px; font-weight: bold;")
 
 class SystemStatusWidget(QWidget):
     """Left side bottom panel for general system and latency status"""
@@ -729,12 +729,12 @@ class SystemStatusWidget(QWidget):
         layout.setSpacing(6)
         
         title = QLabel("SYSTEM STATUS")
-        title.setStyleSheet("color: #ff007f; font-family: 'Segoe UI'; font-size: 14px; font-weight: bold; letter-spacing: 1.5px;")
+        title.setStyleSheet("color: #ff0000; font-family: 'Segoe UI'; font-size: 14px; font-weight: bold; letter-spacing: 1.5px;")
         layout.addWidget(title)
         
         line = QFrame()
         line.setFrameShape(QFrame.HLine)
-        line.setStyleSheet("color: rgba(255, 0, 127, 80); background: rgba(255, 0, 127, 80); height: 1px;")
+        line.setStyleSheet("color: rgba(255, 0, 0, 80); background: rgba(255, 0, 0, 80); height: 1px;")
         layout.addWidget(line)
         
         grid = QHBoxLayout()
@@ -768,18 +768,18 @@ class LiveSessionWidget(QWidget):
         
         header = QHBoxLayout()
         title = QLabel("TONY - LIVE SESSION")
-        title.setStyleSheet("color: #ff007f; font-family: 'Segoe UI'; font-size: 14px; font-weight: bold; letter-spacing: 1.5px;")
+        title.setStyleSheet("color: #ff0000; font-family: 'Segoe UI'; font-size: 14px; font-weight: bold; letter-spacing: 1.5px;")
         header.addWidget(title)
         header.addStretch()
         
         live_badge = QLabel("● LIVE")
-        live_badge.setStyleSheet("color: #ff007f; font-family: 'Segoe UI'; font-size: 10px; font-weight: bold;")
+        live_badge.setStyleSheet("color: #ff0000; font-family: 'Segoe UI'; font-size: 10px; font-weight: bold;")
         header.addWidget(live_badge)
         layout.addLayout(header)
         
         line = QFrame()
         line.setFrameShape(QFrame.HLine)
-        line.setStyleSheet("color: rgba(255, 0, 127, 80); background: rgba(255, 0, 127, 80); height: 1px;")
+        line.setStyleSheet("color: rgba(255, 0, 0, 80); background: rgba(255, 0, 0, 80); height: 1px;")
         layout.addWidget(line)
         
         self.scroll_area = QScrollArea()
@@ -796,7 +796,7 @@ class LiveSessionWidget(QWidget):
                 border-radius: 3px;
             }
             QScrollBar::handle:vertical {
-                background: rgba(255, 0, 127, 80);
+                background: rgba(255, 0, 0, 80);
                 border-radius: 3px;
             }
             QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
@@ -822,8 +822,8 @@ class LiveSessionWidget(QWidget):
         self.input_field.setPlaceholderText("Kuch likhkar bhejo TONY ko...")
         self.input_field.setStyleSheet("""
             QLineEdit {
-                background: rgba(255, 0, 127, 10);
-                border: 1px solid rgba(255, 0, 127, 80);
+                background: rgba(255, 0, 0, 10);
+                border: 1px solid rgba(255, 0, 0, 80);
                 border-radius: 15px;
                 color: #ffffff;
                 font-family: 'Segoe UI';
@@ -831,8 +831,8 @@ class LiveSessionWidget(QWidget):
                 padding: 6px 15px;
             }
             QLineEdit:focus {
-                border: 1px solid #ff007f;
-                background: rgba(255, 0, 127, 20);
+                border: 1px solid #ff0000;
+                background: rgba(255, 0, 0, 20);
             }
         """)
         self.input_field.returnPressed.connect(self.send_text)
@@ -842,7 +842,7 @@ class LiveSessionWidget(QWidget):
         self.send_btn.setFixedSize(32, 32)
         self.send_btn.setStyleSheet("""
             QPushButton {
-                background: #ff007f;
+                background: #ff0000;
                 border: none;
                 border-radius: 16px;
                 color: white;
@@ -890,8 +890,8 @@ class LiveSessionWidget(QWidget):
             sender_lbl.setStyleSheet("color: #ffb6c1; font-family: 'Segoe UI'; font-size: 9px; font-weight: bold;")
             bubble.setStyleSheet("""
                 QFrame {
-                    background: rgba(255, 0, 127, 30);
-                    border: 1px solid rgba(255, 0, 127, 120);
+                    background: rgba(255, 0, 0, 30);
+                    border: 1px solid rgba(255, 0, 0, 120);
                     border-radius: 10px;
                     margin-left: 50px;
                 }
@@ -1000,8 +1000,8 @@ class LiveSessionWidget(QWidget):
             sender_lbl.setStyleSheet("color: #ffb6c1; font-family: 'Segoe UI'; font-size: 9px; font-weight: bold;")
             bubble.setStyleSheet("""
                 QFrame {
-                    background: rgba(255, 0, 127, 30);
-                    border: 1px solid rgba(255, 0, 127, 120);
+                    background: rgba(255, 0, 0, 30);
+                    border: 1px solid rgba(255, 0, 0, 120);
                     border-radius: 10px;
                     margin-left: 50px;
                 }
@@ -1069,7 +1069,7 @@ class CentralVisualizerCore(QWidget):
         
         state = self.state
         if "listening" in state:
-            core_color = QColor(255, 0, 127)
+            core_color = QColor(255, 0, 0)
             particle_color = QColor(255, 215, 0)
             rot_speed = 15.0
             pulse_amp = 8.0
@@ -1085,7 +1085,7 @@ class CentralVisualizerCore(QWidget):
             pulse_amp = 4.0
         elif "executing" in state:
             core_color = QColor(255, 170, 0)
-            particle_color = QColor(255, 0, 127)
+            particle_color = QColor(255, 0, 0)
             rot_speed = 25.0
             pulse_amp = 10.0
         elif "error" in state:
@@ -1095,7 +1095,7 @@ class CentralVisualizerCore(QWidget):
             pulse_amp = 15.0 if int(self.pulse_phase * 2) % 2 == 0 else 0.0
         else:
             core_color = QColor(255, 182, 193)
-            particle_color = QColor(255, 0, 127, 80)
+            particle_color = QColor(255, 0, 0, 80)
             rot_speed = 5.0
             pulse_amp = 3.0
             
@@ -1236,7 +1236,7 @@ class ModernFloatingWindow(QMainWindow):
         bg_widget.setStyleSheet("""
             QWidget#bg_widget {
                 background-color: #050206;
-                border: 2px solid rgba(255, 0, 127, 100);
+                border: 2px solid rgba(255, 0, 0, 100);
             }
         """)
         
@@ -1249,7 +1249,7 @@ class ModernFloatingWindow(QMainWindow):
         top_bar.setSpacing(15)
         
         logo_lbl = QLabel("TONY")
-        logo_lbl.setStyleSheet("color: #ff007f; font-family: 'Segoe UI'; font-size: 18px; font-weight: bold; border: none; background: transparent;")
+        logo_lbl.setStyleSheet("color: #ff0000; font-family: 'Segoe UI'; font-size: 18px; font-weight: bold; border: none; background: transparent;")
         top_bar.addWidget(logo_lbl)
         
         sub_brand = QLabel("VOICE ASSISTANT")
@@ -1261,17 +1261,17 @@ class ModernFloatingWindow(QMainWindow):
         settings_btn = QPushButton("SETTINGS")
         settings_btn.setStyleSheet("""
             QPushButton {
-                background: rgba(255, 0, 127, 20);
-                border: 1px solid #ff007f;
+                background: rgba(255, 0, 0, 20);
+                border: 1px solid #ff0000;
                 border-radius: 12px;
-                color: #ff007f;
+                color: #ff0000;
                 font-family: 'Segoe UI';
                 font-size: 10px;
                 font-weight: bold;
                 padding: 4px 15px;
             }
             QPushButton:hover {
-                background: rgba(255, 0, 127, 40);
+                background: rgba(255, 0, 0, 40);
                 color: white;
             }
         """)
@@ -1280,7 +1280,7 @@ class ModernFloatingWindow(QMainWindow):
         top_bar.addStretch()
         
         self.status_title_lbl = QLabel("• READY")
-        self.status_title_lbl.setStyleSheet("color: #ff007f; font-family: 'Segoe UI'; font-size: 11px; font-weight: bold; border: none; background: transparent;")
+        self.status_title_lbl.setStyleSheet("color: #ff0000; font-family: 'Segoe UI'; font-size: 11px; font-weight: bold; border: none; background: transparent;")
         top_bar.addWidget(self.status_title_lbl)
         
         self.livekit_status_lbl = QLabel("LIVEKIT: OFFLINE")
@@ -1307,9 +1307,9 @@ class ModernFloatingWindow(QMainWindow):
         elite_lbl = QLabel("ELITE")
         elite_lbl.setStyleSheet("""
             QLabel {
-                border: 1px solid #ff007f;
+                border: 1px solid #ff0000;
                 border-radius: 10px;
-                color: #ff007f;
+                color: #ff0000;
                 font-family: 'Segoe UI';
                 font-size: 9px;
                 font-weight: bold;
@@ -1346,15 +1346,15 @@ class ModernFloatingWindow(QMainWindow):
         left_layout.setSpacing(10)
         
         self.sys_monitor = SystemMonitorWidget()
-        self.sys_monitor.setStyleSheet("background: rgba(15, 9, 19, 150); border: 1px solid rgba(255, 0, 127, 40); border-radius: 15px;")
+        self.sys_monitor.setStyleSheet("background: rgba(15, 9, 19, 150); border: 1px solid rgba(255, 0, 0, 40); border-radius: 15px;")
         left_layout.addWidget(self.sys_monitor)
         
         self.voice_engine = VoiceEngineWidget()
-        self.voice_engine.setStyleSheet("background: rgba(15, 9, 19, 150); border: 1px solid rgba(255, 0, 127, 40); border-radius: 15px;")
+        self.voice_engine.setStyleSheet("background: rgba(15, 9, 19, 150); border: 1px solid rgba(255, 0, 0, 40); border-radius: 15px;")
         left_layout.addWidget(self.voice_engine)
         
         self.sys_status = SystemStatusWidget()
-        self.sys_status.setStyleSheet("background: rgba(15, 9, 19, 150); border: 1px solid rgba(255, 0, 127, 40); border-radius: 15px;")
+        self.sys_status.setStyleSheet("background: rgba(15, 9, 19, 150); border: 1px solid rgba(255, 0, 0, 40); border-radius: 15px;")
         left_layout.addWidget(self.sys_status)
         
         content_layout.addWidget(left_container)
@@ -1368,7 +1368,7 @@ class ModernFloatingWindow(QMainWindow):
         center_branding = QVBoxLayout()
         center_branding.setSpacing(2)
         tony_title = QLabel("T O N Y")
-        tony_title.setStyleSheet("color: #ff007f; font-family: 'Segoe UI'; font-size: 48px; font-weight: bold; background: transparent; border: none;")
+        tony_title.setStyleSheet("color: #ff0000; font-family: 'Segoe UI'; font-size: 48px; font-weight: bold; background: transparent; border: none;")
         tony_title.setAlignment(Qt.AlignCenter)
         center_branding.addWidget(tony_title)
         
@@ -1381,10 +1381,10 @@ class ModernFloatingWindow(QMainWindow):
         max_status_lbl = QLabel("ALL SYSTEMS MAXIMUM - TURBO ENGAGED")
         max_status_lbl.setStyleSheet("""
             QLabel {
-                background: rgba(255, 0, 127, 10);
-                border: 1px solid rgba(255, 0, 127, 80);
+                background: rgba(255, 0, 0, 10);
+                border: 1px solid rgba(255, 0, 0, 80);
                 border-radius: 10px;
-                color: #ff007f;
+                color: #ff0000;
                 font-family: 'Segoe UI';
                 font-size: 10px;
                 font-weight: bold;
@@ -1400,7 +1400,7 @@ class ModernFloatingWindow(QMainWindow):
         content_layout.addWidget(center_container)
         
         self.live_session = LiveSessionWidget()
-        self.live_session.setStyleSheet("background: rgba(15, 9, 19, 150); border: 1px solid rgba(255, 0, 127, 40); border-radius: 15px;")
+        self.live_session.setStyleSheet("background: rgba(15, 9, 19, 150); border: 1px solid rgba(255, 0, 0, 40); border-radius: 15px;")
         content_layout.addWidget(self.live_session)
         
         main_layout.addLayout(content_layout)
@@ -1414,7 +1414,7 @@ class ModernFloatingWindow(QMainWindow):
             ("SILENT", "#a000a0"),
             ("BALANCED", "#00ff00"),
             ("PERFORMANCE", "#ffaa00"),
-            ("TURBO", "#ff007f"),
+            ("TURBO", "#ff0000"),
         ]
         
         for name, color_hex in modes:
@@ -1465,7 +1465,7 @@ class ModernFloatingWindow(QMainWindow):
         selected_col = next(col for name, btn, col in self.mode_buttons if name == mode_name)
         button.setStyleSheet(f"""
             QPushButton {{
-                background: rgba(255, 0, 127, 20);
+                background: rgba(255, 0, 0, 20);
                 border: 2px solid {selected_col};
                 border-radius: 15px;
                 color: #ffffff;
@@ -1591,7 +1591,7 @@ class ModernFloatingWindow(QMainWindow):
 
         # ---- Status color
         if "listening" in text_lower:
-            col = "#ff007f"
+            col = "#ff0000"
         elif "speech detected" in text_lower:
             col = "#ff5500"
         elif "transcrib" in text_lower:
