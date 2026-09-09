@@ -1514,6 +1514,12 @@ async def handle_user_transcript(session: AgentSession, transcript: str):
         active_timeout_task.cancel()
 
     turn_ctx.next_turn()  # Increment turn_id to cancel any lingering LLM background tools
+    
+    # CRITICAL: Abort Gemini's native audio auto-response BEFORE the direct router
+    # runs. This prevents the race condition where both Gemini's native response AND
+    # the direct router (or generate_reply fallback) produce duplicate bubbles.
+    _abort_model_turn(session)
+    
     update_gui_status("Executing...")
     turn_ctx.state = "ROUTING"
     turn_ctx.last_handled_at = time.perf_counter()
@@ -1524,15 +1530,19 @@ async def handle_user_transcript(session: AgentSession, transcript: str):
         turn_ctx.last_handled_at = time.perf_counter()
         _finish_direct_turn(session)
     else:
-        # Let Gemini RealtimeModel handle it natively from the audio stream.
-        # DO NOT call session.generate_reply() here — Gemini is already processing
-        # the user's audio and will auto-generate a response. Calling generate_reply
-        # would create a DUPLICATE second response bubble.
-        print(f"[ROUTER] Direct routing failed, deferring to Gemini native audio for: '{clean_text}'")
+        print(f"[ROUTER] Direct routing failed, generating reply via LLM for: '{clean_text}'")
         turn_ctx.state = "LLM_EXECUTION"
         update_gui_status("Processing...")
         timer.t5 = time.perf_counter()
-        print("[T5] Gemini native audio processing (no duplicate generate_reply)")
+        print("[T5] LLM request started (sole response path — native audio already aborted)")
+        try:
+            await session.generate_reply(
+                instructions=f"The user said: '{transcript}'. Respond concisely, directly and helpfully."
+            )
+        except Exception as e:
+            print(f"[LLM] Error in generate_reply: {e}")
+            await speak_local(session, "I heard you, but I couldn't process that command.")
+            _finish_direct_turn(session)
         turn_ctx.last_handled_transcript = clean_text
         turn_ctx.last_handled_at = time.perf_counter()
 
@@ -1546,8 +1556,8 @@ def _init_global_llm():
             _global_llm = RealtimeModel(
                 model="gemini-2.5-flash-native-audio-preview-12-2025",
                 voice="Aoede",  # Female voice
-                temperature=0.7,
-                max_output_tokens=512,
+                temperature=0.8,
+                max_output_tokens=768,
             )
         else:
             raise ValueError(f"RealtimeModel not available. Import error: {import_error}")
@@ -1587,12 +1597,12 @@ class UltimateAdvancedTony(Agent):
             tools=wrapped_tools,
             llm=self._init_llm(),
             min_endpointing_delay=0.05,
-            max_endpointing_delay=0.15,
+            max_endpointing_delay=0.20,
             vad=silero.VAD.load(
                 activation_threshold=0.3,
                 deactivation_threshold=0.25,
                 min_speech_duration=0.03,
-                min_silence_duration=0.20
+                min_silence_duration=0.25
             ),
         )
 
@@ -1805,7 +1815,7 @@ async def entrypoint(ctx: agents.JobContext):
     @session.on("user_input_transcribed")
     def on_user_transcript(ev: agents.voice.UserInputTranscribedEvent):
         global is_speaking_locally, last_local_speech_end
-        if is_speaking_locally or (time.perf_counter() - last_local_speech_end < 0.5):
+        if is_speaking_locally or (time.perf_counter() - last_local_speech_end < 0.8):
             return
         if ev.transcript.strip():
             # Stream partial/final transcript into a single bubble
