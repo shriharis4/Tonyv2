@@ -312,18 +312,19 @@ class AdvancedWhatsAppSender:
                 raise WhatsAppAutomationError("Contact typing failed")
             
             await self._smart_wait(2.0)  # Increased wait for search results
-            
-            # Select and open contact
-            if not await self._execute_with_retry(lambda: pyautogui.press('down')):
-                self.logger.warning("⚠️ Down arrow failed, trying direct enter...")
-                # Try direct enter if down fails
-                if not await self._execute_with_retry(lambda: pyautogui.press('enter')):
-                    raise WhatsAppAutomationError("Contact selection failed")
-            else:
-                await self._smart_wait(0.5)
-                if not await self._execute_with_retry(lambda: pyautogui.press('enter')):
-                    raise WhatsAppAutomationError("Contact opening failed")
-            
+
+            # Select and open the TOP chat result. WhatsApp Desktop keeps
+            # keyboard focus in the search box after typing, so we press
+            # Down once to move the highlight onto the first chat in the
+            # results list, then Enter to open it. If Down somehow fails we
+            # fall back to a direct Enter (which also opens the top result
+            # in most WhatsApp builds). The prior code could leave focus on
+            # the search box and never actually open a chat.
+            await self._execute_with_retry(lambda: pyautogui.press('down'))
+            await self._smart_wait(0.6)
+            if not await self._execute_with_retry(lambda: pyautogui.press('enter')):
+                raise WhatsAppAutomationError("Contact opening failed")
+
             await self._smart_wait(2.0)  # Increased wait for chat to open
             
             # Check timeout

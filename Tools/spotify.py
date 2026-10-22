@@ -132,33 +132,59 @@ async def spotify_previous() -> str:
 
 @function_tool()
 async def spotify_play_song(song_name: str) -> str:
-    """Search and play a specific song on Spotify by its name."""
+    """Search and play a specific song on Spotify by its name. Plays the top result automatically."""
+    import asyncio
     try:
-        # Use Windows protocol to fast-search and launch Spotify if installed
-        import os
         import urllib.parse
         encoded_song = urllib.parse.quote(song_name)
+
+        # Ensure Spotify is running and focused first, so the search URI
+        # lands in a ready window rather than cold-starting the app.
+        spotify_windows = [w for w in gw.getAllWindows() if 'spotify' in w.title.lower()]
+        if not spotify_windows:
+            os.startfile("spotify:")
+            # Poll for the window to appear instead of a fixed long sleep.
+            for _ in range(20):  # up to ~5s
+                await asyncio.sleep(0.25)
+                spotify_windows = [w for w in gw.getAllWindows() if 'spotify' in w.title.lower()]
+                if spotify_windows:
+                    break
+
+        # Trigger the in-app search via URI.
         os.startfile(f"spotify:search:{encoded_song}")
-        
-        time.sleep(2) # Wait for Spotify to handle the URI and render the search page
-        
-        # Get window to ensure it's in foreground
+
+        # Wait for the search results to actually render. The previous fixed
+        # 2s sleep was often too short, so the keypresses fired before the
+        # list existed and nothing played. Give the UI time to populate.
+        await asyncio.sleep(3.0)
+
         spotify_windows = [w for w in gw.getAllWindows() if 'spotify' in w.title.lower()]
         if spotify_windows:
-            spotify_windows[0].activate()
-            time.sleep(0.5)
-            
-            # Select first result and play
+            try:
+                spotify_windows[0].activate()
+            except Exception:
+                pass
+            await asyncio.sleep(0.6)
+
+            # Reliable "play the top result" sequence for the Spotify desktop
+            # app: move keyboard focus off the search box into the results
+            # grid, land on the first track, and press Enter to play it.
+            # Two Tabs is what reaches the first result row in the current
+            # Spotify layout; Enter on a track row starts playback.
             pyautogui.press('tab')
-            time.sleep(0.1)
+            await asyncio.sleep(0.3)
+            pyautogui.press('tab')
+            await asyncio.sleep(0.3)
             pyautogui.press('enter')
-            time.sleep(0.5)
+            await asyncio.sleep(0.4)
+            # Some layouts land on the "Songs" section header first; a second
+            # Enter on the highlighted top track guarantees playback starts.
             pyautogui.press('enter')
-            
-            return f"🎵 Playing: {song_name}"
-        
+
+            return f"🎵 Playing the top result for: {song_name}"
+
         return "❌ Could not find Spotify window"
-        
+
     except Exception as e:
         return f"❌ Error: {str(e)}"
 

@@ -1,4 +1,3 @@
-import pandas as pd
 import os
 import pyautogui
 import time
@@ -140,6 +139,7 @@ async def create_excel_file(file_name: str) -> str:
             file_name += '.xlsx'
 
         file_path = os.path.join(documents_folder, file_name)
+        import pandas as pd  # Lazy import: pandas is heavy (~0.3s) and only used here.
         df = pd.DataFrame()
         df.to_excel(file_path, index=False)
         current_excel_file = file_path
@@ -697,3 +697,100 @@ async def calculate_sum_fallback(target_cell: str) -> str:
         
     except Exception as e:
         return f"❌ Error: {str(e)}"
+
+
+# ========== FORMULA ENTRY & CHARTS (native, file-based) ==========
+
+@function_tool()
+async def enter_excel_formula(cell_address: str, formula: str) -> str:
+    """
+    Enters an arbitrary Excel formula into a specific cell of the currently
+    open/created workbook (tracked via `current_excel_file`), then saves.
+
+    Args:
+        cell_address: Target cell, e.g. "B5".
+        formula: Formula text. A leading "=" is added automatically if
+            missing, e.g. "SUM(A1:A3)" or "=SUM(A1:A3)".
+
+    Returns:
+        str: Confirmation or error message.
+    """
+    global current_excel_file
+    try:
+        if not current_excel_file or not os.path.exists(current_excel_file):
+            return "❌ No active Excel file tracked. Create or open one first with create_excel_file()."
+
+        formula = formula.strip()
+        if not formula.startswith("="):
+            formula = "=" + formula
+
+        import openpyxl
+        wb = openpyxl.load_workbook(current_excel_file)
+        ws = wb.active
+        ws[cell_address.upper()] = formula
+        wb.save(current_excel_file)
+
+        return f"✅ Formula {formula} entered in cell {cell_address.upper()} and saved."
+    except Exception as e:
+        return f"❌ Error entering formula: {str(e)}"
+
+
+@function_tool()
+async def create_excel_chart(
+    data_range: str,
+    chart_type: str = "bar",
+    title: str = "Chart",
+) -> str:
+    """
+    Creates a basic chart (bar, line, or pie) from a cell range in the
+    currently tracked Excel workbook and saves it.
+
+    Args:
+        data_range: Cell range for chart data, e.g. "A1:B5" (first column
+            used as categories, remaining columns as series).
+        chart_type: "bar", "line", or "pie".
+        title: Chart title text.
+
+    Returns:
+        str: Confirmation or error message.
+    """
+    global current_excel_file
+    try:
+        if not current_excel_file or not os.path.exists(current_excel_file):
+            return "❌ No active Excel file tracked. Create or open one first with create_excel_file()."
+
+        import openpyxl
+        from openpyxl.chart import BarChart, LineChart, PieChart, Reference
+        from openpyxl.utils.cell import range_boundaries
+
+        wb = openpyxl.load_workbook(current_excel_file)
+        ws = wb.active
+
+        chart_map = {"bar": BarChart, "line": LineChart, "pie": PieChart}
+        chart_cls = chart_map.get(chart_type.lower().strip(), BarChart)
+        chart = chart_cls()
+        chart.title = title
+
+        # Parse the range string unambiguously via openpyxl's own utility
+        # (handles "A1:B5" and single-cell "A1" alike) instead of relying on
+        # fragile indexing into ws[range], which always returns a tuple of
+        # tuples for a colon-range.
+        min_col, min_row, max_col, max_row = range_boundaries(data_range.upper())
+
+        data = Reference(ws, min_col=min_col + 1 if max_col > min_col else min_col,
+                          max_col=max_col, min_row=min_row, max_row=max_row)
+        cats = Reference(ws, min_col=min_col, min_row=min_row, max_row=max_row)
+
+        if chart_type.lower().strip() == "pie":
+            chart.add_data(data, titles_from_data=False)
+        else:
+            chart.add_data(data, titles_from_data=True)
+        chart.set_categories(cats)
+
+        anchor_cell = f"{openpyxl.utils.get_column_letter(max_col + 2)}{min_row}"
+        ws.add_chart(chart, anchor_cell)
+        wb.save(current_excel_file)
+
+        return f"✅ {chart_type.capitalize()} chart '{title}' created from {data_range} and saved."
+    except Exception as e:
+        return f"❌ Error creating chart: {str(e)}"

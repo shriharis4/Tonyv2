@@ -1,5 +1,4 @@
 import asyncio
-from langchain_community.document_loaders import WebBaseLoader
 from livekit.agents import function_tool
 import aiohttp
 import json
@@ -29,6 +28,9 @@ async def web_scraper(query: str, url: str) -> str:
         # Step 1: Web Scraping
         print("🌐 Scraping website...")
         try:
+            # Lazy import: langchain_community is heavy (~0.4s) and only needed
+            # here, so importing it on first use keeps app startup fast.
+            from langchain_community.document_loaders import WebBaseLoader
             loader = WebBaseLoader(web_paths=(url,),)
             docs = loader.load()
             

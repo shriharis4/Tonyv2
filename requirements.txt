@@ -33,3 +33,9 @@ PyQt5
 keyboard
 plotly
 statsmodels
+python-pptx
+playwright
+pywin32
+pytest
+pytest-asyncio
+

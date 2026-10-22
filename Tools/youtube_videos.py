@@ -34,23 +34,41 @@ async def play_media(media_name: str, media_type: Literal["song", "video"] = "so
                 await asyncio.create_task(asyncio.to_thread(webbrowser.open, f"https://www.youtube.com/watch?v={video['id']['videoId']}"))
                 return f"🎵 अब बज रहा है: {video['snippet']['title']}"
 
-        # FAST Fallback: Scrape the first video ID without API key
+        # FAST Fallback: Scrape the first real video ID without API key.
         import urllib.request
         import urllib.parse
         import re
-        
+
         query_string = urllib.parse.urlencode({"search_query": media_name})
-        html_content = await asyncio.to_thread(urllib.request.urlopen, "https://www.youtube.com/results?" + query_string)
+        req = urllib.request.Request(
+            "https://www.youtube.com/results?" + query_string,
+            headers={"User-Agent": "Mozilla/5.0"},  # avoid consent/alt layouts
+        )
+        html_content = await asyncio.to_thread(urllib.request.urlopen, req)
         html_text = await asyncio.to_thread(html_content.read)
-        html_text = html_text.decode('utf-8')
-        
-        search_results = re.findall(r'/watch\?v=(.{11})', html_text)
-        if search_results:
-            video_id = search_results[0]
-            await asyncio.create_task(asyncio.to_thread(webbrowser.open, f"https://www.youtube.com/watch?v={video_id}"))
+        html_text = html_text.decode("utf-8", errors="ignore")
+
+        # Prefer the structured videoId from YouTube's embedded JSON (the
+        # genuine top video result), falling back to the raw watch-link
+        # regex. De-duplicate so we take the first UNIQUE id, skipping
+        # repeated thumbnail/preview references to the same clip.
+        video_id = None
+        json_ids = re.findall(r'"videoId":"([\w-]{11})"', html_text)
+        if json_ids:
+            video_id = json_ids[0]
+        else:
+            link_ids = re.findall(r"/watch\?v=([\w-]{11})", html_text)
+            if link_ids:
+                video_id = link_ids[0]
+
+        if video_id:
+            # Direct watch URL auto-plays the top result — no UI automation
+            # needed, which keeps latency low and avoids the "shows but
+            # doesn't play" problem.
+            await asyncio.to_thread(webbrowser.open, f"https://www.youtube.com/watch?v={video_id}")
             return f"🎵 YouTube पर '{media_name}' बज रहा है..."
-            
-        await asyncio.create_task(asyncio.to_thread(webbrowser.open, f"https://www.youtube.com/results?search_query={media_name}"))
+
+        await asyncio.to_thread(webbrowser.open, f"https://www.youtube.com/results?search_query={urllib.parse.quote(media_name)}")
         return f"YouTube पर '{media_name}' खोल रहा हूँ..."
     except Exception as e:
         logger.error(f"मीडिया त्रुटि: {e}")

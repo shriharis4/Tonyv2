@@ -1,5 +1,29 @@
 import sys
 import builtins
+import logging
+import logging.handlers
+import os as _os_for_log
+from pathlib import Path as _PathForLog
+
+# =========================
+# GLOBAL PRINT -> ROTATING LOG FILE BRIDGE
+# =========================
+# Every print() call across the whole app (runtime_agent.py AND every
+# Tools/*.py module, since builtins.print is patched process-wide) is
+# mirrored to a rotating log file. This gives persistent, structured logs
+# for post-hoc debugging without requiring call-site-by-call-site
+# migration of ~140+ existing print() statements, while still printing to
+# the console for live debugging.
+_LOG_DIR = _PathForLog(__file__).resolve().parents[1] / "logs"
+_LOG_DIR.mkdir(exist_ok=True)
+_file_log_handler = logging.handlers.RotatingFileHandler(
+    _LOG_DIR / "tony.log", maxBytes=5 * 1024 * 1024, backupCount=5, encoding="utf-8"
+)
+_file_log_handler.setFormatter(logging.Formatter("%(asctime)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+_file_logger = logging.getLogger("tony.console")
+_file_logger.setLevel(logging.INFO)
+_file_logger.addHandler(_file_log_handler)
+_file_logger.propagate = False
 
 # Safe print wrapper to prevent UnicodeEncodeError on legacy Windows consoles
 _original_print = print
@@ -16,6 +40,11 @@ def print(*args, **kwargs):
         else:
             new_args.append(arg)
     _original_print(*new_args, **kwargs)
+    try:
+        sep = kwargs.get('sep', ' ')
+        _file_logger.info(sep.join(str(a) for a in new_args))
+    except Exception:
+        pass  # Logging must never break the app's console output.
 
 builtins.print = print
 
@@ -71,6 +100,10 @@ from livekit.plugins import noise_cancellation
 from livekit.plugins import silero
 
 # Gemini realtime (network-safe & import-safe)
+# NOTE: `network_available` here really means "RealtimeModel SDK import
+# succeeded" (checked once, at import time) — it is NOT a live network
+# reachability signal. Use `is_network_reachable()` below for an
+# up-to-date runtime check instead of trusting this flag indefinitely.
 network_available = False
 import_error = None
 try:
@@ -84,6 +117,21 @@ except Exception as e1:
         import_error = f"Path 1: {e1} | Path 2: {e2}"
         print(f"[WARN] Failed to import RealtimeModel from both paths: {import_error}")
 
+
+def is_network_reachable(host: str = "8.8.8.8", port: int = 53, timeout: float = 2.0) -> bool:
+    """
+    Lightweight, fast runtime connectivity check (TCP connect to a
+    well-known DNS endpoint) — re-checked on demand rather than relying on
+    a flag captured once at import time. Used by the Gemini retry/backoff
+    path to distinguish "SDK unavailable" from "network currently down".
+    """
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
 # =========================
 # PROMPTS
 # =========================
@@ -94,51 +142,70 @@ from .prompts import (
 )
 
 # =========================
-# TOOLS (ALL)
+# TOOLS (ALL) — single source of truth: tool_registry.py
 # =========================
-from Tools.manage_windows import manage_window, list_windows
-from Tools.search_web import search_web
-from Tools.send_whatsapp_message import send_whatsapp_message, send_whatsapp_message_advanced
-from Tools.system_power_action import system_power_action
-from Tools.type_user_message_auto import type_user_message_auto, create_essay_in_notepad, write_essay_in_notepad
-from Tools.write_in_notepad import write_in_notepad
-from Tools.desktop_control import desktop_control
-from Tools.scroll_content import scroll_content
-from Tools.code_handler import fix_code_error
-from Tools.file_searching import universal_file_opener
-from Tools.press_key import press_key, use_smart_clipboard
-from Tools.open_app import open_app
-from Tools.scan_system_for_viruses import scan_system_for_viruses
-from Tools.time_volume_bright import (
-    control_screen_brightness,
-    control_system_volume,
-    get_time_info,
-    get_weather,
-    get_system_info_deep,
-    get_current_volume,
-    get_system_status,
+from tool_registry import (
+    manage_window, list_windows,
+    search_web,
+    send_whatsapp_message, send_whatsapp_message_advanced,
+    system_power_action,
+    type_user_message_auto, create_essay_in_notepad, write_essay_in_notepad,
+    write_in_notepad,
+    desktop_control,
+    scroll_content,
+    fix_code_error,
+    universal_file_opener,
+    press_key, use_smart_clipboard,
+    open_app,
+    scan_system_for_viruses,
+    control_screen_brightness, control_system_volume, get_time_info, get_weather,
+    get_system_info_deep, get_current_volume, get_system_status,
+    execute_multi_task,
+    generate_ai_image,
+    generate_and_type_code, run_file_in_vscode,
+    get_top_news,
+    play_media,
+    set_reminder, view_reminders, cancel_reminder,
+    screen_short,
+    process_document_query,
+    send_media_to_whatsapp,
+    create_excel_file, save_excel_changes, delete_all_data, move_left, move_up,
+    enter_data_quick, enter_multiple_data_quick, move_down, move_right,
+    delete_current_cell, go_to_cell, toggle_text_bold, select_row_or_column,
+    sort_excel_data, excel_clipboard_action, calculate_sum,
+    enter_excel_formula, create_excel_chart,
+    word_to_pdf, image_to_pdf, excel_to_pdf, ppt_to_pdf, convert_image_format, test_converters,
+    create_here,
+    read_screen_text,
+    camera_analysis,
+    analyze_screen,
+    analyze_local_image, identify_objects_in_image, extract_text_from_image,
+    analyze_photo_composition, detect_image_authenticity,
+    describe_image_for_visually_impaired, get_image_color_analysis, compare_images,
+    open_spotify, spotify_next, spotify_previous, spotify_play_song,
+    spotify_play_liked, spotify_pause, spotify_play,
+    click_on_screen_text, click_text, find_all_text, verify_ocr_setup,
+    schedule_task, view_scheduled_tasks, cancel_scheduled_task,
+    web_scraper,
+    perform_computer_action,
+    # Workstream 3 additions
+    write_document, edit_existing_file,
+    create_presentation, edit_presentation,
+    rename_file_or_folder, move_file_or_folder, copy_file_or_folder,
+    delete_file_or_folder, search_files_by_content, zip_paths, unzip_archive,
+    batch_rename,
+    browser_automate,
+    send_email,
+    get_tool_timeout,
+    get_all_tool_functions,
 )
-from Tools.multi_task import execute_multi_task
-from Tools.generate_ai_image import generate_ai_image
-from Tools.code_generator import generate_and_type_code, run_file_in_vscode
-from Tools.news_provider import get_top_news
-from Tools.youtube_videos import play_media
-from Tools.reminder import set_reminder, view_reminders, cancel_reminder
-from Tools.screen_short import screen_short
-from Tools.pdf_reader import process_document_query
-from Tools.send_media_whatsapp import send_media_to_whatsapp
-from Tools.excel_data_entery  import create_excel_file,save_excel_changes,delete_all_data,move_left,move_up,enter_data_quick,enter_multiple_data_quick,move_down,move_right,delete_current_cell,go_to_cell,toggle_text_bold,select_row_or_column,sort_excel_data,excel_clipboard_action,calculate_sum
-from Tools.word_to_pdf  import word_to_pdf,image_to_pdf,excel_to_pdf,ppt_to_pdf,convert_image_format,test_converters
-from Tools.create_folder  import create_here
-from Tools.read_screen_text import read_screen_text
-from Tools.camera_analysis import camera_analysis
-from Tools.screen_analyzer import analyze_screen
-from Tools.image_analysis import analyze_local_image, identify_objects_in_image, extract_text_from_image, analyze_photo_composition, detect_image_authenticity, describe_image_for_visually_impaired, get_image_color_analysis, compare_images
-from Tools.spotify import open_spotify,spotify_next,spotify_previous,spotify_play_song,spotify_play_liked,spotify_pause, spotify_play
-from Tools.click_on_text import click_on_screen_text, click_text, find_all_text, verify_ocr_setup
-from Tools.schedule_task import schedule_task, view_scheduled_tasks, cancel_scheduled_task
-from Tools.webScrping import web_scraper
-from Tools.computer_use import perform_computer_action
+from Tools.tool_result import ok as tool_ok, fail, is_failure
+from core.logging_config import get_logger, log_turn_outcome
+
+router_logger = get_logger("router")
+tool_logger = get_logger("tool")
+
+
 
 # =========================
 # GUI CALLBACKS & SIGNAL BRIDGE
@@ -459,7 +526,44 @@ class TurnTimer:
         avg_latency = sum(latency_history) / len(latency_history)
         update_gui_latency(total_latency, avg_latency)
 
+        # Persist this turn's timing breakdown to SQLite for offline latency
+        # analysis (computing p50/p95 over many turns). Best-effort and
+        # non-blocking: failures here must never affect the turn.
+        try:
+            _persist_turn_timing(self, total_latency)
+        except Exception:
+            pass
+
 current_timer = None
+
+# Shared memory DB handle for timing persistence (lazy, best-effort).
+_timing_db = None
+
+
+def _persist_turn_timing(timer, total_latency: float) -> None:
+    """Write a TurnTimer's latency breakdown to the SQLite turn_timings
+    table. Lazily opens a single shared MemoryDatabase. Any failure is
+    swallowed by the caller so it never affects the live turn."""
+    global _timing_db
+    if _timing_db is None:
+        from memory_db import MemoryDatabase
+        _timing_db = MemoryDatabase()
+
+    def _seg(a, b):
+        return (b - a) if (a and b) else None
+
+    route = "direct" if (timer.t7 and timer.t8) else "llm"
+    _timing_db.log_turn_timing(
+        command=timer.command or "",
+        route=route,
+        total_latency=round(total_latency, 3),
+        speech_to_transcript=_seg(timer.t2 or timer.t1, timer.t3),
+        transcript_to_router=_seg(timer.t3, timer.t4),
+        router_to_tool=_seg(timer.t4, timer.t7),
+        tool_duration=_seg(timer.t7, timer.t8),
+        tts_duration=_seg(timer.t9, timer.t10),
+    )
+
 
 def get_or_create_timer():
     global current_timer
@@ -482,6 +586,11 @@ class TurnContext:
         self.last_processed_at = 0.0
         self.last_spoken_text = ""
         self.is_active = True
+        # Pending destructive-action confirmation gate. When a destructive
+        # action (shutdown/restart/hibernate, file delete) is requested,
+        # the router sets this instead of executing immediately, and only
+        # fires on an explicit affirmative reply within the time window.
+        self.pending_confirmation = None  # {"action": str, "handler": callable, "requested_at": float}
         
     def next_turn(self):
         self.turn_id += 1
@@ -502,19 +611,44 @@ def _normalize_command(text: str) -> str:
     return re.sub(r"\s+", " ", text.strip().lower())
 
 async def execute_tool(func, *args, **kwargs):
+    """
+    Execute a tool callable with a timeout tiered by tool category
+    (in_process ~2s, app_launch ~8s, network ~15s — see
+    tool_registry.get_tool_timeout()), with crash isolation so a single
+    tool exception or hang can never take down the turn or the
+    AgentSession.
+
+    Returns the tool's own result string on success. On timeout or
+    exception, returns a structured failure string (see Tools/tool_result.py)
+    instead of raising — callers in the router/LLM-tool-calling path should
+    never need a bare try/except around this call.
+    """
     # Unpack FunctionTool wrapper if present
     target_func = func
     if hasattr(func, "_func"):
         target_func = func._func
     elif hasattr(func, "__wrapped__"):
         target_func = func.__wrapped__
-        
-    if asyncio.iscoroutinefunction(target_func):
-        return await target_func(*args, **kwargs)
-    else:
-        return await asyncio.get_running_loop().run_in_executor(
-            None, lambda: target_func(*args, **kwargs)
-        )
+
+    tool_name = getattr(target_func, "__name__", "unknown_tool")
+    timeout = get_tool_timeout(tool_name)
+
+    try:
+        if asyncio.iscoroutinefunction(target_func):
+            return await asyncio.wait_for(target_func(*args, **kwargs), timeout=timeout)
+        else:
+            return await asyncio.wait_for(
+                asyncio.get_running_loop().run_in_executor(
+                    None, lambda: target_func(*args, **kwargs)
+                ),
+                timeout=timeout,
+            )
+    except asyncio.TimeoutError:
+        router_logger.warning(f"[TOOL] {tool_name} timed out after {timeout:.0f}s")
+        return fail(f"'{tool_name}' timed out after {timeout:.0f} seconds.", detail="timeout")
+    except Exception as e:
+        router_logger.error(f"[TOOL] {tool_name} raised an exception: {e}", exc_info=True)
+        return fail(f"'{tool_name}' failed to execute.", detail=str(e))
 
 def _abort_model_turn(session: AgentSession) -> None:
     """Stop Gemini from also acting on a turn that the direct router already handled."""
@@ -623,31 +757,68 @@ async def wait_for_process(process_name: str, timeout: float = 3.0) -> bool:
     return False
 
 async def route_command_directly(session: AgentSession, command: str) -> bool:
+    global turn_ctx
     clean_command = command.strip().lower()
     clean_command = re.sub(r'^(hey\s+)?tony\b\s*', '', clean_command).strip()
     clean_command = re.sub(r'^[,\.\?!\s]+|[,\.\?!\s]+$', '', clean_command).strip()
     
     if not clean_command:
         return False
-        
+
+    # --- DESTRUCTIVE ACTION CONFIRMATION GATE ---
+    # If a destructive action (shutdown/restart/hibernate) is awaiting
+    # confirmation, this turn's utterance is checked against it FIRST,
+    # before any other routing. An affirmative reply executes the pending
+    # action; anything else (including silence timeout via normal turn
+    # flow) cancels it. This guarantees no destructive action ever
+    # executes on a single ambiguous utterance. Pending confirmations
+    # expire after 20s so a stale "yes" long after the fact can't trigger
+    # an old shutdown request.
+    if turn_ctx.pending_confirmation:
+        pending = turn_ctx.pending_confirmation
+        turn_ctx.pending_confirmation = None
+        expired = (time.perf_counter() - pending.get("requested_at", 0)) > 20.0
+        affirmative = re.search(r'\b(yes|yeah|yep|confirm|do it|go ahead|haan|sure)\b', clean_command)
+        negative = re.search(r'\b(no|nope|cancel|don\'?t|stop|nahi)\b', clean_command)
+        if affirmative and not negative and not expired:
+            print(f"[ROUTER] Destructive action confirmed: {pending['action']}")
+            _abort_model_turn(session)
+            await pending["handler"]()
+            return True
+        else:
+            reason = "expired" if expired else "no explicit confirmation"
+            print(f"[ROUTER] Destructive action cancelled ({reason}): {pending['action']}")
+            _abort_model_turn(session)
+            await speak_local(session, f"Okay, cancelled. I will not {pending['action']}.")
+            return True
+
     print(f"[ROUTER] Checking direct command: '{clean_command}'")
     timer = get_or_create_timer()
     
     async def run_tool_helper(func, *args, **kwargs):
         timer.t7 = time.perf_counter()
-        print(f"[T7] tool started: {func.__name__}")
+        tool_name = getattr(func, "__name__", "unknown_tool")
+        print(f"[T7] tool started: {tool_name}")
         res = await execute_tool(func, *args, **kwargs)
         timer.t8 = time.perf_counter()
-        print(f"[T8] tool completed: {func.__name__}")
+        print(f"[T8] tool completed: {tool_name}")
+        log_turn_outcome(clean_command, "direct_router", tool_name, not is_failure(res) if isinstance(res, str) else True,
+                         detail=res if isinstance(res, str) else "")
         return res
 
-    # Strip conversational filler prefixes recursively
+    # Strip conversational filler prefixes recursively.
+    # HARDENED (spec Workstream 2 item 5): the bare generic words "my" and
+    # "the" are split out into a prefix-only list. Stripping them from the
+    # END of a command (as the old greedy stripper did) could corrupt the
+    # real target — e.g. a command/target that legitimately ends in "the"
+    # or "my". They're only removed as leading filler now, never trailing,
+    # and never when they are the entire remaining command.
     fillers = [
         "could you please", "would you please", "can you please",
         "could you", "would you", "can you", "please", "hey tony", "tony",
         "for me", "for us", "me", "now", "immediately", "quickly", "fast",
-        "can my", "launch my", "open my", "start my", "run my", "my", "the"
     ]
+    prefix_only_fillers = ["my", "the"]
     changed = True
     while changed:
         changed = False
@@ -664,6 +835,33 @@ async def route_command_directly(session: AgentSession, command: str) -> bool:
                 clean_command = ""
                 changed = True
                 break
+        if changed:
+            continue
+        # Prefix-only generic words: strip ONLY as a leading token, and only
+        # if there is still a real target word after them.
+        for f in prefix_only_fillers:
+            if clean_command.startswith(f + " ") and len(clean_command) > len(f) + 1:
+                clean_command = clean_command[len(f) + 1:].strip()
+                changed = True
+                break
+
+    # --- AMBIGUITY GUARD (spec Workstream 2 item 4) ---
+    # If, after filler stripping, the command is just a bare action verb
+    # with no target (e.g. "open", "close", "play", "search"), don't guess
+    # a target — ask a short clarifying question via speak_local instead of
+    # firing a tool against nothing. "play"/"pause"/"next" alone are handled
+    # by the Spotify block (valid as media transport controls), so they're
+    # excluded here.
+    _bare_ambiguous_verbs = {
+        "open", "close", "launch", "start", "exit", "run", "set",
+        "search", "google", "message", "whatsapp", "create", "find",
+    }
+    if clean_command in _bare_ambiguous_verbs:
+        print(f"[ROUTER] Ambiguous bare verb '{clean_command}' - asking for clarification")
+        _abort_model_turn(session)
+        await speak_local(session, f"{clean_command.capitalize()} what?")
+        log_turn_outcome(clean_command, "ambiguity_clarification", "none", True, detail="asked for target")
+        return True
 
     # 1. CHECK FOR MULTI-STEP COMMANDS
     if any(sep in clean_command for sep in [" then ", " and ", ","]):
@@ -820,29 +1018,34 @@ async def route_command_directly(session: AgentSession, command: str) -> bool:
             return True
 
         # Close Applications/Active window
-        if any(x in clean_command for x in ["close", "exit", "terminate", "quit", "बंद", "band", "क्लोज"]):
+        # Word-boundary matching to avoid "close"/"exit" substring collisions
+        # (e.g. bare substring checks would also match "exit" inside unrelated
+        # words). Target detection also now requires a true word boundary so
+        # "code" only matches "code"/"vs code"/"vscode" as whole words, not
+        # as a substring of some other target phrase.
+        if re.search(r'\b(close|exit|terminate|quit|बंद|band|क्लोज)\b', clean_command):
             close_target = None
-            if "chrome" in clean_command or "browser" in clean_command or "क्रोम" in clean_command:
+            if re.search(r'\b(chrome|browser|क्रोम)\b', clean_command):
                 close_target = "chrome"
-            elif "whatsapp" in clean_command:
+            elif re.search(r'\bwhatsapp\b', clean_command):
                 close_target = "whatsapp"
-            elif "spotify" in clean_command:
+            elif re.search(r'\bspotify\b', clean_command):
                 close_target = "spotify"
-            elif "vs code" in clean_command or "vscode" in clean_command or "code" in clean_command:
+            elif re.search(r'\b(vs\s*code|vscode|code)\b', clean_command):
                 close_target = "code"
-            elif "notepad" in clean_command:
+            elif re.search(r'\bnotepad\b', clean_command):
                 close_target = "notepad"
-            elif "calculator" in clean_command or "calc" in clean_command:
+            elif re.search(r'\b(calculator|calc)\b', clean_command):
                 close_target = "calculator"
-            elif "excel" in clean_command:
+            elif re.search(r'\bexcel\b', clean_command):
                 close_target = "excel"
-            elif "word" in clean_command:
+            elif re.search(r'\bword\b', clean_command):
                 close_target = "word"
-            elif "explorer" in clean_command:
+            elif re.search(r'\bexplorer\b', clean_command):
                 close_target = "explorer"
-            elif "task manager" in clean_command:
+            elif re.search(r'\btask\s*manager\b', clean_command):
                 close_target = "task manager"
-            elif "paint" in clean_command:
+            elif re.search(r'\bpaint\b', clean_command):
                 close_target = "paint"
             else:
                 close_target = "active"
@@ -861,33 +1064,41 @@ async def route_command_directly(session: AgentSession, command: str) -> bool:
                 return True
 
         # Open Applications (English, Hindi, Hinglish, Reverse syntax)
-        if any(x in clean_command for x in ["open", "launch", "run", "start", "show", "display", "khol", "kholo", "chalao", "curve", "karo", "ओपन", "खोल"]):
+        # Word-boundary matching throughout: previously a bare `"code" in
+        # clean_command` substring check here would also fire for phrases
+        # like "decode this" or "barcode scanner" that happen to contain
+        # "code" as a substring. Negative lookahead excludes "write code" /
+        # "generate code" phrasing, which means "produce code", not "launch
+        # the VS Code app" — that should fall through to Gemini / code tools.
+        if re.search(r'\b(open|launch|run|start|show|display|khol|kholo|chalao|karo|ओपन|खोल)\b', clean_command):
             open_target = None
-            if "chrome" in clean_command or "browser" in clean_command:
+            if re.search(r'\b(chrome|browser)\b', clean_command):
                 open_target = "chrome"
-            elif "recycle" in clean_command or "रिसाइकल" in clean_command or "trash" in clean_command:
+            elif re.search(r'\b(recycle|trash|रिसाइकल)\b', clean_command):
                 open_target = "recycle bin"
-            elif "whatsapp" in clean_command:
+            elif re.search(r'\bwhatsapp\b', clean_command):
                 open_target = "whatsapp"
-            elif "spotify" in clean_command:
+            elif re.search(r'\bspotify\b', clean_command):
                 open_target = "spotify"
-            elif "vs code" in clean_command or "vscode" in clean_command or "code" in clean_command:
+            elif re.search(r'\b(vs\s*code|vscode)\b', clean_command) or (
+                re.search(r'\bcode\b', clean_command) and not re.search(r'\b(write|generate|fix|debug)\s+(\w+\s+)?code\b', clean_command)
+            ):
                 open_target = "vscode"
-            elif "notepad" in clean_command:
+            elif re.search(r'\bnotepad\b', clean_command):
                 open_target = "notepad"
-            elif "calculator" in clean_command or "calc" in clean_command:
+            elif re.search(r'\b(calculator|calc)\b', clean_command):
                 open_target = "calculator"
-            elif "excel" in clean_command:
+            elif re.search(r'\bexcel\b', clean_command):
                 open_target = "excel"
-            elif "word" in clean_command:
+            elif re.search(r'\bword\b', clean_command):
                 open_target = "word"
-            elif "explorer" in clean_command or "file explorer" in clean_command:
+            elif re.search(r'\b(file\s+explorer|explorer)\b', clean_command):
                 open_target = "explorer"
-            elif "task manager" in clean_command or "taskmgr" in clean_command:
+            elif re.search(r'\b(task\s*manager|taskmgr)\b', clean_command):
                 open_target = "task manager"
-            elif "paint" in clean_command or "mspaint" in clean_command:
+            elif re.search(r'\b(paint|mspaint)\b', clean_command):
                 open_target = "paint"
-            elif "settings" in clean_command:
+            elif re.search(r'\bsettings\b', clean_command):
                 open_target = "settings"
                 
             if open_target:
@@ -1165,6 +1376,26 @@ async def route_command_directly(session: AgentSession, command: str) -> bool:
                 action = "sleep"
             elif "hibernate" in clean_command:
                 action = "hibernate"
+
+            # Destructive/disruptive actions (shutdown/restart/hibernate) require
+            # explicit confirmation before executing — never fire on a single
+            # ambiguous utterance. Lock/sleep are reversible and execute immediately.
+            if action in ("shutdown", "restart", "hibernate"):
+                print(f"[ROUTER] system_power_action({action}) requires confirmation - asking user")
+                _abort_model_turn(session)
+
+                async def _confirmed_power_action(a=action):
+                    await run_tool_helper(system_power_action, a)
+                    await speak_local(session, f"Executing {a}.")
+
+                turn_ctx.pending_confirmation = {
+                    "action": action,
+                    "handler": _confirmed_power_action,
+                    "requested_at": time.perf_counter(),
+                }
+                await speak_local(session, f"Are you sure you want to {action} the computer? Say yes to confirm.")
+                return True
+
             print(f"[ROUTER] Direct command matched: system_power_action({action})")
             _abort_model_turn(session)
             await run_tool_helper(system_power_action, action)
@@ -1286,14 +1517,11 @@ async def route_command_directly(session: AgentSession, command: str) -> bool:
             return True
 
     except Exception as e:
-        print(f"[ROUTER] Error executing direct tool: {e}")
-        import traceback
-        traceback.print_exc()
+        router_logger.error(f"[ROUTER] Error executing direct tool: {e}", exc_info=True)
         # CRITICAL: reset turn state on error so the assistant isn't permanently wedged
-        global turn_ctx
         turn_ctx.state = "IDLE"
-        
-        
+        log_turn_outcome(clean_command, "router_exception", "unknown", False, detail=str(e))
+
         _abort_model_turn(session)
         await speak_local(session, "Sorry, I encountered an error running that command.")
         update_gui_status("Listening...")
@@ -1455,17 +1683,83 @@ async def handle_user_transcript(session: AgentSession, transcript: str):
         turn_ctx.state = "LLM_EXECUTION"
         update_gui_status("Processing...")
         timer.t5 = time.perf_counter()
-        print("[T5] LLM request started (sole response path — native audio already aborted)")
+        print("[T5] LLM request started (sole response path - native audio already aborted)")
+        await _generate_reply_with_retry(session, transcript)
+        turn_ctx.last_handled_transcript = clean_text
+        turn_ctx.last_handled_at = time.perf_counter()
+        # CRITICAL FIX: the LLM-fallback branch previously never reset
+        # turn_ctx.state back to IDLE (only the direct-router branch did, via
+        # _finish_direct_turn). That left state stuck at "LLM_EXECUTION" after
+        # any Gemini-routed command, so every subsequent turn hit the
+        # "PREEMPTING previous turn" path and the assistant felt wedged until
+        # the 30s safety backstop fired — exactly the "works for 2-3 commands
+        # then gets stuck in a loop" symptom. Always return to idle listening
+        # here so follow-up commands route cleanly.
+        _finish_direct_turn(session)
+
+# =========================
+# GEMINI RETRY / GRACEFUL DEGRADATION
+# =========================
+# Tracks consecutive Gemini failures so we can surface a one-time spoken
+# notice when entering degraded mode, and re-check reachability on each
+# call rather than trusting a single import-time flag forever.
+_gemini_consecutive_failures = 0
+_gemini_degraded_mode = False
+_GEMINI_DEGRADED_THRESHOLD = 2  # consecutive failures before announcing degraded mode
+
+
+async def _generate_reply_with_retry(session: AgentSession, transcript: str, max_retries: int = 1) -> bool:
+    """
+    Call session.generate_reply() with one retry-with-backoff on failure.
+    On repeated failure, degrade gracefully: tell the user complex
+    requests are temporarily limited but direct commands still work,
+    rather than hanging or returning a bare generic error every time.
+    """
+    global _gemini_consecutive_failures, _gemini_degraded_mode
+
+    attempt = 0
+    last_error = None
+    while attempt <= max_retries:
         try:
             await session.generate_reply(
                 instructions=f"The user said: '{transcript}'. Respond concisely, directly and helpfully."
             )
+            if _gemini_consecutive_failures > 0:
+                router_logger.info("[GEMINI] Recovered after previous failure(s)")
+            _gemini_consecutive_failures = 0
+            _gemini_degraded_mode = False
+            return True
         except Exception as e:
-            print(f"[LLM] Error in generate_reply: {e}")
-            await speak_local(session, "I heard you, but I couldn't process that command.")
-            _finish_direct_turn(session)
-        turn_ctx.last_handled_transcript = clean_text
-        turn_ctx.last_handled_at = time.perf_counter()
+            last_error = e
+            attempt += 1
+            if attempt <= max_retries:
+                backoff_seconds = 0.5 * attempt
+                router_logger.warning(f"[GEMINI] generate_reply failed (attempt {attempt}/{max_retries + 1}): {e}. Retrying in {backoff_seconds:.1f}s")
+                await asyncio.sleep(backoff_seconds)
+
+    _gemini_consecutive_failures += 1
+    router_logger.error(f"[GEMINI] generate_reply failed after {max_retries + 1} attempt(s): {last_error}", exc_info=True)
+    log_turn_outcome(transcript, "llm_fallback", "generate_reply", False, detail=str(last_error))
+
+    if _gemini_consecutive_failures >= _GEMINI_DEGRADED_THRESHOLD and not _gemini_degraded_mode:
+        _gemini_degraded_mode = True
+        network_up = await asyncio.get_running_loop().run_in_executor(None, is_network_reachable)
+        if network_up:
+            notice = (
+                "I'm having trouble reaching my AI engine right now. Direct commands like opening apps, "
+                "volume, and screenshots will still work, but complex requests are temporarily limited."
+            )
+        else:
+            notice = (
+                "It looks like the network connection is down. Direct commands will still work, "
+                "but I can't reach the AI engine for complex requests until the connection is back."
+            )
+        await speak_local(session, notice)
+    else:
+        await speak_local(session, "I heard you, but I couldn't process that command.")
+
+    _finish_direct_turn(session)
+    return False
 
 _global_llm = None
 
@@ -1509,7 +1803,18 @@ class UltimateAdvancedTony(Agent):
             analyze_screen, analyze_local_image, extract_text_from_image,
             write_in_notepad, create_essay_in_notepad,
             set_reminder, schedule_task,
-            execute_multi_task
+            execute_multi_task,
+            # Workstream 3 coverage tools — these have no dedicated direct-router
+            # intent, so they must go to the LLM to be reachable at all.
+            write_document, edit_existing_file,
+            create_presentation, edit_presentation,
+            enter_excel_formula, create_excel_chart,
+            rename_file_or_folder, move_file_or_folder, copy_file_or_folder,
+            delete_file_or_folder, search_files_by_content, zip_paths, unzip_archive,
+            batch_rename,
+            browser_automate,
+            send_email,
+            perform_computer_action,
         ]
 
         wrapped_tools = [make_timing_decorator(t) for t in tools]
@@ -1690,6 +1995,57 @@ class UltimateAdvancedTony(Agent):
             await self._trigger_reminder(f"Failed to execute scheduled task '{desc}': {e}")
 
 # =========================
+# STARTUP SELF-CHECK
+# =========================
+def _run_startup_self_check() -> None:
+    """
+    Verify LiveKit credentials, Gemini reachability, and OS automation
+    permissions up front, surfacing one clear actionable summary instead
+    of failing silently deep into a later turn. Never raises or blocks
+    startup — this is diagnostic, not a hard gate, since some permissions
+    (e.g. OCR) are optional-feature-only.
+    """
+    issues = []
+
+    # 1. LiveKit credentials
+    missing_livekit = [v for v in ("LIVEKIT_URL", "LIVEKIT_API_KEY", "LIVEKIT_API_SECRET") if not os.getenv(v)]
+    if missing_livekit:
+        issues.append(f"LiveKit credentials missing: {', '.join(missing_livekit)}. Voice sessions will not connect.")
+
+    # 2. Gemini / AI provider reachability
+    if not network_available:
+        issues.append(f"Gemini Realtime SDK failed to import: {import_error}. LLM fallback will be unavailable.")
+    elif not os.getenv("GOOGLE_API_KEY"):
+        issues.append("GOOGLE_API_KEY is not set. Gemini Realtime will fail to authenticate.")
+    else:
+        reachable = is_network_reachable()
+        if not reachable:
+            issues.append("Network connectivity check failed (could not reach 8.8.8.8:53). Gemini calls may fail until connectivity is restored.")
+
+    # 3. OS automation permissions (OCR dependency used by click_on_text / perform_computer_action's click_text)
+    try:
+        import pytesseract
+        pytesseract.get_tesseract_version()
+    except ImportError:
+        issues.append("pytesseract is not installed. OCR-based screen-text/click features will be unavailable.")
+    except Exception:
+        issues.append(
+            "Tesseract OCR binary not found on PATH. OCR-based 'click the X button' features will be "
+            "unavailable until it's installed (see README)."
+        )
+
+    if issues:
+        router_logger.warning("[STARTUP SELF-CHECK] " + " | ".join(issues))
+        print("\n[STARTUP SELF-CHECK] Potential issues detected:")
+        for i, issue in enumerate(issues, 1):
+            print(f"  {i}. {issue}")
+        print("[STARTUP SELF-CHECK] Tony will still start, but the above features may not work.\n")
+    else:
+        router_logger.info("[STARTUP SELF-CHECK] All checks passed.")
+        print("[STARTUP SELF-CHECK] All checks passed.")
+
+
+# =========================
 # ENTRYPOINT
 # =========================
 _greeting_sent = False
@@ -1701,6 +2057,7 @@ async def entrypoint(ctx: agents.JobContext):
         return
 
     print("[INFO] Starting Tony...")
+    _run_startup_self_check()
     global active_session, background_loop, active_room, worker_loop
     active_room = ctx.room
     worker_loop = asyncio.get_running_loop()
