@@ -24,8 +24,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 LOG_DIR = PROJECT_ROOT / "logs"
 LOG_DIR.mkdir(exist_ok=True)
 
-_MAIN_LOG_FILE = LOG_DIR / "tony.log"
-_ACCURACY_LOG_FILE = LOG_DIR / "routing_accuracy.log"
+_MAIN_LOG_FILE = LOG_DIR / os.environ.get("TONY_LOG_FILE", "tony.log")
+_ACCURACY_LOG_FILE = LOG_DIR / (
+    "routing_accuracy_test.log" if os.environ.get("TONY_LOG_FILE") else "routing_accuracy.log"
+)
 
 _configured = False
 _accuracy_logger = None

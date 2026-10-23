@@ -1,464 +1,417 @@
-import pyautogui
+"""
+WhatsApp Desktop message sender — VERIFIED flow.
+
+Every step is checked against WhatsApp's real UI (Windows UI Automation)
+before the next one runs, and success is only reported when WhatsApp itself
+shows it:
+
+  1. open/focus WhatsApp via the 'whatsapp:' protocol (no typing into
+     Windows search)
+  2. put the contact name into "Search or start a new chat" (set directly,
+     not typed key-by-key)
+  3. read the search results and pick the chat whose NAME matches the
+     contact (exact, or a very close unique match). If none matches, stop
+     and return the closest names -> nothing is sent to the wrong person
+  4. open that chat and confirm the composer reads "Type a message to
+     <that contact>"
+  5. paste the message, read the composer back to confirm the exact text
+  6. press Enter and confirm the composer emptied (message left the box)
+
+Any failed check returns a ❌ result, so Tony never says "message sent"
+when it wasn't.
+"""
+
+from __future__ import annotations
+
+import difflib
+import os
+import re
+import time
+from typing import List, Optional, Tuple
+
 import asyncio
-import aiohttp
-import json
+import pyautogui
 from livekit.agents import function_tool
 
-async def translate_to_english_free(text: str) -> str:
-    """
-    Translate text to English using free APIs without API keys
-    """
-    if not text.strip():
-        return text
-    
-    # Check if text is already in English
-    if is_english(text):
-        return text
-    
-    # Try multiple free translation services
-    translation = await try_google_translate(text)
-    if translation:
-        return translation
-    
-    translation = await try_my_memory_translate(text)
-    if translation:
-        return translation
-    
-    translation = await try_libretranslate(text)
-    if translation:
-        return translation
-    
-    # Fallback to basic translation if all APIs fail
-    return fallback_translation(text)
+try:
+    from Tools.tool_result import ok, fail
+except Exception:  # pragma: no cover - import path fallback
+    from tool_result import ok, fail
 
-def is_english(text: str) -> bool:
-    """Check if text is already in English"""
-    try:
-        return all(ord(char) < 128 or char.isspace() for char in text)
-    except:
+# Poll timeouts (seconds). Tests shrink these.
+FOCUS_TIMEOUT = 8.0
+RESULTS_TIMEOUT = 3.0
+CHAT_OPEN_TIMEOUT = 4.0
+VERIFY_TIMEOUT = 2.0
+POLL = 0.15
+FUZZY_MIN = 0.85
+
+_TIME_OR_DATE = re.compile(
+    r"\s+(?:\d{1,2}:\d{2}\s*(?:am|pm)?|\d{1,2}/\d{1,2}/\d{2,4}|yesterday|today|"
+    r"monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
+    re.IGNORECASE,
+)
+
+
+def row_contact_name(row_name: str) -> str:
+    """'Bro 11:19 am Hello' -> 'Bro'; 'NoBroker.com 11/03/2026 ...' -> 'NoBroker.com'."""
+    row_name = (row_name or "").strip()
+    m = _TIME_OR_DATE.search(row_name)
+    return (row_name[: m.start()] if m else row_name).strip()
+
+
+def pick_contact(contact: str, row_names: List[str]) -> Tuple[Optional[int], List[str]]:
+    """Return (index of the matching chat row or None, closest names).
+    Exact (case-insensitive) name match wins; otherwise a single close
+    fuzzy match (>= FUZZY_MIN); otherwise no match (never guess)."""
+    want = contact.strip().lower()
+    names = [row_contact_name(r) for r in row_names]
+    exact = [i for i, n in enumerate(names) if n.lower() == want]
+    if exact:
+        return exact[0], []
+    scored = sorted(
+        ((difflib.SequenceMatcher(None, want, n.lower()).ratio(), i) for i, n in enumerate(names)),
+        reverse=True,
+    )
+    close = [(s, i) for s, i in scored if s >= FUZZY_MIN]
+    if len(close) == 1 or (len(close) > 1 and close[0][0] - close[1][0] >= 0.1):
+        return close[0][1], []
+    suggestions = []
+    for s, i in scored:
+        if s >= 0.5 and names[i] not in suggestions:
+            suggestions.append(names[i])
+    return None, suggestions[:3]
+
+
+def _wait(pred, timeout: float):
+    end = time.monotonic() + timeout
+    while True:
+        v = pred()
+        if v:
+            return v
+        if time.monotonic() >= end:
+            return v
+        time.sleep(POLL)
+
+
+def _ensure_foreground(ui) -> bool:
+    """WhatsApp must be the active window before any input. Focus can blip
+    briefly while the 'whatsapp:' activation settles, so wait a moment and
+    re-activate once instead of failing on a single check."""
+    if _wait(ui.is_foreground, min(1.0, FOCUS_TIMEOUT)):
+        return True
+    ui.launch()
+    return bool(_wait(ui.is_foreground, FOCUS_TIMEOUT))
+
+
+# ---------------------------------------------------------------------------
+# Real UI driver (Windows UI Automation via comtypes)
+# ---------------------------------------------------------------------------
+class RealWhatsAppUI:
+    SEARCH_NAME = "Search or start a new chat"
+
+    def __init__(self):
+        import comtypes
+        import comtypes.client
+        comtypes.CoInitialize()
+        comtypes.client.GetModule("UIAutomationCore.dll")
+        from comtypes.gen import UIAutomationClient as U
+        self.U = U
+        self.uia = comtypes.client.CreateObject(U.CUIAutomation, interface=U.IUIAutomation)
+        self._root = None
+
+    def close(self):
+        try:
+            import comtypes
+            comtypes.CoUninitialize()
+        except Exception:
+            pass
+
+    # -- window ----------------------------------------------------------
+    def _hwnd(self):
+        import win32gui, win32process, psutil
+        found = []
+
+        def cb(h, _):
+            if win32gui.IsWindowVisible(h) and win32gui.GetWindowText(h):
+                try:
+                    pid = win32process.GetWindowThreadProcessId(h)[1]
+                    if "whatsapp" in psutil.Process(pid).name().lower():
+                        found.append(h)
+                except Exception:
+                    pass
+            return True
+
+        win32gui.EnumWindows(cb, None)
+        return found[0] if found else None
+
+    def launch(self):
+        """Open WhatsApp and bring it to the front. Windows blocks a
+        background process from taking focus, so after the protocol launch
+        we restore the window and use the standard AttachThreadInput +
+        Alt-tap workaround to make it the foreground window."""
+        os.startfile("whatsapp:")
+        h = _wait(self._hwnd, 6.0)
+        if not h:
+            return
+        try:
+            import win32gui, win32con, win32process, win32api
+            if win32gui.IsIconic(h):
+                win32gui.ShowWindow(h, win32con.SW_RESTORE)
+            fg = win32gui.GetForegroundWindow()
+            cur = win32api.GetCurrentThreadId()
+            fg_thread = win32process.GetWindowThreadProcessId(fg)[0] if fg else 0
+            attached = False
+            if fg_thread and fg_thread != cur:
+                attached = bool(win32process.AttachThreadInput(cur, fg_thread, True))
+            try:
+                # Alt tap (no key is typed into any app) unlocks SetForegroundWindow.
+                win32api.keybd_event(0x12, 0, 0, 0)
+                win32api.keybd_event(0x12, 0, 2, 0)
+                win32gui.BringWindowToTop(h)
+                win32gui.SetForegroundWindow(h)
+            finally:
+                if attached:
+                    win32process.AttachThreadInput(cur, fg_thread, False)
+        except Exception:
+            pass
+
+    def is_foreground(self) -> bool:
+        try:
+            import win32gui, win32process, psutil
+            h = win32gui.GetForegroundWindow()
+            pid = win32process.GetWindowThreadProcessId(h)[1]
+            return "whatsapp" in psutil.Process(pid).name().lower()
+        except Exception:
+            return False
+
+    def _root_el(self):
+        h = self._hwnd()
+        return self.uia.ElementFromHandle(h) if h else None
+
+    def _doc(self):
+        """WhatsApp's web content root. Querying inside it is ~0.03s;
+        querying the whole window walks the browser shell and took ~7s."""
+        root = self._root_el()
+        if root is None:
+            return None
+        doc = root.FindFirst(self.U.TreeScope_Descendants, self.uia.CreatePropertyCondition(
+            self.U.UIA_AutomationIdPropertyId, "RootWebArea"))
+        return doc or root
+
+    def _find_all(self, cond):
+        doc = self._doc()
+        if doc is None:
+            return []
+        arr = doc.FindAll(self.U.TreeScope_Descendants, cond)
+        return [arr.GetElement(i) for i in range(arr.Length)]
+
+    def _value(self, el) -> str:
+        try:
+            vp = el.GetCurrentPattern(self.U.UIA_ValuePatternId)
+            return vp.QueryInterface(self.U.IUIAutomationValuePattern).CurrentValue or ""
+        except Exception:
+            return ""
+
+    def _edits(self):
+        return self._find_all(self.uia.CreatePropertyCondition(
+            self.U.UIA_ControlTypePropertyId, self.U.UIA_EditControlTypeId))
+
+    def _name(self, el) -> str:
+        try:
+            return el.CurrentName or ""
+        except Exception:
+            return ""
+
+    # -- search ----------------------------------------------------------
+    def _search_box(self):
+        # Its name ("Search or start a new chat") is only present while the
+        # box is empty, so pick the first edit that isn't the chat composer.
+        for e in self._edits():
+            if not self._name(e).startswith("Type a message"):
+                return e
+        return None
+
+    def search(self, text: str) -> bool:
+        box = self._search_box()
+        if box is None:
+            return False
+        box.SetFocus()
+        vp = box.GetCurrentPattern(self.U.UIA_ValuePatternId).QueryInterface(self.U.IUIAutomationValuePattern)
+        vp.SetValue(text)
         return True
 
-async def try_google_translate(text: str) -> str:
-    """
-    Try Google Translate (free unofficial API)
-    """
-    try:
-        url = "https://translate.googleapis.com/translate_a/single"
-        params = {
-            'client': 'gtx',
-            'sl': 'auto',  # source language (auto-detect)
-            'tl': 'en',    # target language (English)
-            'dt': 't',
-            'q': text
-        }
-        
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
-            async with session.get(url, params=params) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    # Extract translated text from response
-                    if data and len(data) > 0:
-                        translated_parts = [part[0] for part in data[0] if part[0]]
-                        return ''.join(translated_parts)
-    except Exception as e:
-        print(f"Google Translate failed: {e}")
-    return None
+    def clear_search(self):
+        try:
+            self.search("")
+        except Exception:
+            pass
 
-async def try_my_memory_translate(text: str) -> str:
-    """
-    Try MyMemory Translation API (free)
-    """
-    try:
-        url = "https://api.mymemory.translated.net/get"
-        params = {
-            'q': text,
-            'langpair': 'auto|en'
-        }
-        
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
-            async with session.get(url, params=params) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    if data.get('responseStatus') == 200:
-                        return data['responseData']['translatedText']
-    except Exception as e:
-        print(f"MyMemory Translate failed: {e}")
-    return None
-
-async def try_libretranslate(text: str) -> str:
-    """
-    Try LibreTranslate (free open-source)
-    """
-    try:
-        # Try different LibreTranslate instances
-        instances = [
-            "https://libretranslate.de/translate",
-            "https://translate.argosopentech.com/translate",
-            "https://libretranslate.pussthecat.org/translate"
-        ]
-        
-        payload = {
-            'q': text,
-            'source': 'auto',
-            'target': 'en',
-            'format': 'text'
-        }
-        
-        headers = {
-            'Content-Type': 'application/json'
-        }
-        
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
-            for instance_url in instances:
-                try:
-                    async with session.post(instance_url, 
-                                          data=json.dumps(payload), 
-                                          headers=headers) as response:
-                        if response.status == 200:
-                            data = await response.json()
-                            return data.get('translatedText')
-                except:
-                    continue  # Try next instance
-                    
-    except Exception as e:
-        print(f"LibreTranslate failed: {e}")
-    return None
-
-def fallback_translation(text: str) -> str:
-    """
-    Basic fallback translation for common words
-    """
-    basic_translations = {
-        # Hindi
-        "नमस्ते": "hello", "हैलो": "hello", "हाय": "hi", "कैसे": "how", "हो": "are",
-        "आप": "you", "तुम": "you", "मैं": "I", "मेरा": "my", "नाम": "name",
-        "धन्यवाद": "thank you", "शुक्रिया": "thanks", "कृपया": "please",
-        "हाँ": "yes", "ना": "no", "नहीं": "no", "ठीक": "ok", "अच्छा": "good",
-        
-        # Actions
-        "लिखो": "write", "टाइप": "type", "बनाओ": "make", "करो": "do",
-        "दिखाओ": "show", "भेजो": "send", "खोलो": "open", "बंद": "close",
-        
-        # Common words
-        "मदद": "help", "समय": "time", "दिन": "day", "रात": "night",
-        "क्या": "what", "क्यों": "why", "कब": "when", "कहाँ": "where"
-    }
-    
-    words = text.split()
-    translated_words = []
-    
-    for word in words:
-        clean_word = word.strip('.,!?;:').lower()
-        if clean_word in basic_translations:
-            translated_words.append(basic_translations[clean_word])
-        else:
-            translated_words.append(word)
-    
-    return ' '.join(translated_words)
-
-
-
-
-import asyncio
-import logging
-from dataclasses import dataclass
-from typing import Optional, Callable
-from enum import Enum
-from livekit.agents import function_tool
-import pyautogui
-import time
-
-
-class WhatsAppState(Enum):
-    """State machine for WhatsApp automation"""
-    INITIAL = "initial"
-    SEARCHING = "searching"
-    CONTACT_FOUND = "contact_found"
-    MESSAGE_SENT = "message_sent"
-    ERROR = "error"
-
-
-@dataclass
-class AutomationConfig:
-    """Configuration for automation parameters"""
-    key_press_delay: float = 0.08  # Increased for stability
-    search_timeout: float = 10.0   # Increased timeout
-    animation_wait: float = 2.0    # Increased for slow systems
-    fail_safe: bool = True
-    pause_duration: float = 0.1    # Increased pause
-    mode: str = "balanced"  # balanced, fast, reliable
-
-
-class WhatsAppAutomationError(Exception):
-    """Custom exception for WhatsApp automation failures"""
-    pass
-
-
-class AdvancedWhatsAppSender:
-    """
-    Advanced WhatsApp message sender with optimized performance
-    Uses state machine pattern for reliable automation
-    """
-    
-    def __init__(self, config: Optional[AutomationConfig] = None):
-        self.config = config or AutomationConfig()
-        self.logger = self._setup_logger()
-        self.state = WhatsAppState.INITIAL
-        
-        # Initialize pyautogui settings
-        pyautogui.FAILSAFE = self.config.fail_safe
-        pyautogui.PAUSE = self.config.pause_duration
-        
-    def _setup_logger(self) -> logging.Logger:
-        """Setup advanced logging"""
-        logger = logging.getLogger("AdvancedWhatsAppSender")
-        logger.setLevel(logging.INFO)
-        
-        if not logger.handlers:
-            handler = logging.StreamHandler()
-            formatter = logging.Formatter(
-                '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-            )
-            handler.setFormatter(formatter)
-            logger.addHandler(handler)
-            
-        return logger
-    
-    async def _execute_with_retry(self, 
-                                action: Callable, 
-                                max_retries: int = 3,
-                                delay: float = 1.5) -> bool:  # Increased delay
-        """
-        Execute action with retry mechanism
-        """
-        for attempt in range(max_retries):
+    def chat_rows(self) -> List[str]:
+        """Names of result rows in the Chats/Contacts sections (stops at the
+        'Messages' section, which lists message hits, not chats)."""
+        self._rows = []
+        rows = self._find_all(self.uia.CreatePropertyCondition(
+            self.U.UIA_ControlTypePropertyId, self.U.UIA_DataItemControlTypeId))
+        out, section = [], None
+        for r in rows:
             try:
-                await asyncio.to_thread(action)
-                return True
-            except Exception as e:
-                self.logger.warning(f"Attempt {attempt + 1} failed: {e}")
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(delay)
+                name = (r.CurrentName or "").strip()
+            except Exception:
+                continue  # row vanished while the list was updating
+            low = name.lower()
+            if low in ("chats", "contacts", "groups", "messages"):
+                section = low
                 continue
-        return False
-    
-    async def _smart_wait(self, duration: float = None):
-        """Intelligent waiting with dynamic duration"""
-        wait_time = duration or self.config.animation_wait
-        self.logger.info(f"⏳ Waiting for {wait_time}s...")
-        await asyncio.sleep(wait_time)
-    
-    async def _open_whatsapp(self) -> bool:
-        """Open WhatsApp using Windows search with optimized approach"""
+            if section in ("chats", "contacts", "groups") and name and name not in out:
+                out.append(name)
+                self._rows.append(r)
+        return out
+
+    def open_row(self, index: int) -> bool:
+        r = self._rows[index]
+        rc = r.CurrentBoundingRectangle
+        if rc.right <= rc.left or rc.bottom <= rc.top:
+            return False
+        pyautogui.click((rc.left + rc.right) // 2, (rc.top + rc.bottom) // 2)
+        return True
+
+    # -- composer ------------------------------------------------------------
+    def _composer(self):
+        for e in self._edits():
+            if self._name(e).startswith("Type a message"):
+                return e
+        return None
+
+    def composer_name(self) -> Optional[str]:
+        c = self._composer()
+        return self._name(c) if c is not None else None
+
+    def composer_text(self) -> str:
+        c = self._composer()
+        return self._value(c).strip() if c is not None else ""
+
+    def paste_into_composer(self, text: str) -> bool:
+        """Paste via the clipboard (handles any characters, instant). The
+        user's clipboard is restored only AFTER WhatsApp shows the text -
+        WhatsApp reads the clipboard asynchronously, and restoring it after
+        a fixed 0.25s made it paste the OLD clipboard (verified live)."""
+        import win32clipboard
+        c = self._composer()
+        if c is None:
+            return False
+        c.SetFocus()
+        old = None
         try:
-            self.logger.info("🔍 Opening WhatsApp...")
-            
-            # Press Windows key
-            if not await self._execute_with_retry(lambda: pyautogui.press('win')):
-                raise WhatsAppAutomationError("Failed to press Windows key")
-            
-            await self._smart_wait(1.0)  # Increased wait
-            
-            # Type WhatsApp - using English for universal compatibility
-            if not await self._execute_with_retry(
-                lambda: pyautogui.typewrite('whatsapp', interval=self.config.key_press_delay)
-            ):
-                raise WhatsAppAutomationError("Failed to type WhatsApp")
-            
-            await self._smart_wait(0.8)  # Increased wait
-            
-            # Press Enter
-            if not await self._execute_with_retry(lambda: pyautogui.press('enter')):
-                raise WhatsAppAutomationError("Failed to open WhatsApp")
-            
-            # Wait for WhatsApp to load - increased time
-            await self._smart_wait(4.0)  # Increased for slow loading
-            
-            self.state = WhatsAppState.SEARCHING
-            self.logger.info("✅ WhatsApp opened successfully")
-            return True
-            
-        except Exception as e:
-            self.state = WhatsAppState.ERROR
-            self.logger.error(f"❌ Failed to open WhatsApp: {e}")
-            raise WhatsAppAutomationError(f"WhatsApp opening failed: {str(e)}")
-    
-    async def _search_and_select_contact(self, contact: str) -> bool:
-        """Advanced contact search with timeout handling"""
-        try:
-            self.logger.info(f"👤 Searching for contact: {contact}")
-            start_time = time.time()
-            
-            # Press Ctrl+F for search - universal shortcut
-            if not await self._execute_with_retry(
-                lambda: pyautogui.hotkey('ctrl', 'f')
-            ):
-                raise WhatsAppAutomationError("Search shortcut failed")
-            
-            await self._smart_wait(2.0)  # Increased wait for search to open
-            
-            # Clear any existing text and type contact name
-            if not await self._execute_with_retry(
-                lambda: pyautogui.hotkey('ctrl', 'a')  # Select all
-            ):
-                self.logger.warning("⚠️ Select all failed, continuing...")
-            
-            # Type contact name with reasonable speed
-            contact = await translate_to_english_free(contact)
-            
-            if not await self._execute_with_retry(
-                lambda: pyautogui.typewrite(contact, interval=0.1)  # Slower typing for reliability
-            ):
-                raise WhatsAppAutomationError("Contact typing failed")
-            
-            await self._smart_wait(2.0)  # Increased wait for search results
+            win32clipboard.OpenClipboard()
+            try:
+                old = win32clipboard.GetClipboardData(win32clipboard.CF_UNICODETEXT)
+            except Exception:
+                old = None
+            win32clipboard.EmptyClipboard()
+            win32clipboard.SetClipboardText(text, win32clipboard.CF_UNICODETEXT)
+        finally:
+            win32clipboard.CloseClipboard()
+        pyautogui.hotkey("ctrl", "v")
+        _wait(lambda: self.composer_text() == text.strip(), VERIFY_TIMEOUT)
+        if old is not None:
+            try:
+                win32clipboard.OpenClipboard()
+                win32clipboard.EmptyClipboard()
+                win32clipboard.SetClipboardText(old, win32clipboard.CF_UNICODETEXT)
+            except Exception:
+                pass
+            finally:
+                try:
+                    win32clipboard.CloseClipboard()
+                except Exception:
+                    pass
+        return True
 
-            # Select and open the TOP chat result. WhatsApp Desktop keeps
-            # keyboard focus in the search box after typing, so we press
-            # Down once to move the highlight onto the first chat in the
-            # results list, then Enter to open it. If Down somehow fails we
-            # fall back to a direct Enter (which also opens the top result
-            # in most WhatsApp builds). The prior code could leave focus on
-            # the search box and never actually open a chat.
-            await self._execute_with_retry(lambda: pyautogui.press('down'))
-            await self._smart_wait(0.6)
-            if not await self._execute_with_retry(lambda: pyautogui.press('enter')):
-                raise WhatsAppAutomationError("Contact opening failed")
-
-            await self._smart_wait(2.0)  # Increased wait for chat to open
-            
-            # Check timeout
-            elapsed_time = time.time() - start_time
-            if elapsed_time > self.config.search_timeout:
-                self.logger.warning(f"⚠️ Search took {elapsed_time:.1f}s (timeout: {self.config.search_timeout}s)")
-                # Don't raise error immediately, continue if possible
-            
-            self.state = WhatsAppState.CONTACT_FOUND
-            self.logger.info(f"✅ Contact '{contact}' selected successfully")
-            return True
-            
-        except Exception as e:
-            self.state = WhatsAppState.ERROR
-            self.logger.error(f"❌ Contact search failed: {e}")
-            raise WhatsAppAutomationError(f"Contact search failed: {str(e)}")
-    
-    async def _send_message(self, message: str) -> bool:
-        """Optimized message sending with validation"""
-        try:
-            self.logger.info(f"📝 Typing message: {message[:50]}...")
-            
-            # Type message with reasonable speed
-            message = await translate_to_english_free(message)
-            if not await self._execute_with_retry(
-                lambda: pyautogui.typewrite(message, interval=0.07)  # Balanced typing speed
-            ):
-                raise WhatsAppAutomationError("Message typing failed")
-            
-            await self._smart_wait(0.5)  # Wait before sending
-            
-            # Send message
-            if not await self._execute_with_retry(lambda: pyautogui.press('enter')):
-                raise WhatsAppAutomationError("Message sending failed")
-            
-            await self._smart_wait(1.0)  # Wait after sending
-            
-            self.state = WhatsAppState.MESSAGE_SENT
-            self.logger.info("✅ Message sent successfully")
-            return True
-            
-        except Exception as e:
-            self.state = WhatsAppState.ERROR
-            self.logger.error(f"❌ Message sending failed: {e}")
-            raise WhatsAppAutomationError(f"Message sending failed: {str(e)}")
+    def press_enter(self):
+        pyautogui.press("enter")
 
 
-# Single function tool with multiple modes
+# ---------------------------------------------------------------------------
+# Verified send flow (pure logic; works with the real or a fake UI driver)
+# ---------------------------------------------------------------------------
+def send_flow(ui, contact: str, message: str) -> str:
+    contact = (contact or "").strip()
+    message = (message or "").strip()
+    if not contact:
+        return fail("No WhatsApp contact name was given.")
+    if not message:
+        return fail(f"No message text was given for {contact}.")
+
+    # 1. open + focus
+    ui.launch()
+    if not _ensure_foreground(ui):
+        return fail("WhatsApp did not come to the front; nothing was typed.")
+
+    # 2-3. search and pick the exact chat
+    if not ui.search(contact):
+        return fail("Could not find WhatsApp's search box; nothing was sent.")
+    rows = _wait(ui.chat_rows, RESULTS_TIMEOUT) or []
+    idx, suggestions = pick_contact(contact, rows)
+    if idx is None:
+        ui.clear_search()
+        hint = f" Closest names: {', '.join(suggestions)}." if suggestions else ""
+        return fail(f"No WhatsApp chat named '{contact}' was found, so nothing was sent.{hint}")
+    chat_name = row_contact_name(rows[idx])
+
+    # 4. open the chat and confirm it's the right one
+    if not _ensure_foreground(ui):
+        return fail("WhatsApp lost focus before opening the chat; nothing was sent.")
+    if not ui.open_row(idx):
+        return fail(f"Could not open the chat with {chat_name}; nothing was sent.")
+    opened = _wait(lambda: (ui.composer_name() or "").lower().endswith(f"to {chat_name.lower()}"),
+                   CHAT_OPEN_TIMEOUT)
+    if not opened:
+        return fail(f"The chat with {chat_name} did not open; nothing was sent.")
+
+    # 5. put the message in and verify it exactly
+    if ui.composer_text():
+        return fail(f"The message box for {chat_name} already had a draft; nothing was sent.")
+    if not _ensure_foreground(ui) or not ui.paste_into_composer(message):
+        return fail(f"Could not type into the chat with {chat_name}; nothing was sent.")
+    if not _wait(lambda: ui.composer_text() == message, VERIFY_TIMEOUT):
+        return fail(f"The message text did not appear correctly for {chat_name}; it was not sent.")
+
+    # 6. send and confirm the box emptied
+    if not _ensure_foreground(ui):
+        return fail(f"WhatsApp lost focus before sending to {chat_name}; the message was not sent.")
+    ui.press_enter()
+    if not _wait(lambda: ui.composer_text() == "", VERIFY_TIMEOUT):
+        return fail(f"WhatsApp did not confirm the message to {chat_name} was sent.")
+    return ok(f"Message sent to {chat_name}: \"{message}\"")
+
+
+def _send_blocking(contact: str, message: str) -> str:
+    ui = RealWhatsAppUI()
+    try:
+        return send_flow(ui, contact, message)
+    except Exception as e:
+        return fail("WhatsApp automation failed; the message may not have been sent.", detail=str(e))
+    finally:
+        ui.close()
+
+
 @function_tool()
 async def send_whatsapp_message(contact: str, message: str, mode: str = "balanced") -> str:
     """
-    Advanced WhatsApp message sender with multiple optimization modes.
-    Uses English search for universal compatibility.
-    
+    Send a WhatsApp message to a saved contact or chat. Verifies the right
+    chat is open and the message actually left the box before reporting
+    success; returns a failure (with closest contact names) otherwise.
+
     Args:
-        contact: Contact name/number (English search compatible)
-        message: Message content to send
-        mode: Operation mode - "fast", "balanced", "reliable"
-        
-    Returns:
-        str: Delivery confirmation with follow-up prompt
+        contact: Contact or chat name exactly as saved in WhatsApp
+        message: Message text to send
+        mode: Kept for compatibility; ignored
     """
-    
-    # Configuration based on mode - increased delays for stability
-    configs = {
-        "fast": AutomationConfig(
-            key_press_delay=0.06,    # Balanced speed
-            search_timeout=12.0,     # Increased timeout
-            animation_wait=1.5,      # Reasonable waits
-            pause_duration=0.08,
-            mode="fast"
-        ),
-        "balanced": AutomationConfig(
-            key_press_delay=0.08,    # Reliable speed
-            search_timeout=15.0,     # Good timeout
-            animation_wait=2.0,
-            pause_duration=0.1,
-            mode="balanced"
-        ),
-        "reliable": AutomationConfig(
-            key_press_delay=0.1,     # Slow and steady
-            search_timeout=20.0,     # Maximum timeout
-            animation_wait=3.0,      # Maximum waits
-            pause_duration=0.15,
-            mode="reliable"
-        )
-    }
-    
-    config = configs.get(mode, configs["balanced"])
-    sender = AdvancedWhatsAppSender(config)
-    
-    try:
-        sender.logger.info(f"🚀 Starting WhatsApp send: {contact} | Mode: {mode}")
-        
-        # Store original mouse position
-        original_pos = await asyncio.to_thread(pyautogui.position)
-        sender.logger.info(f"📍 Original position: {original_pos}")
-        
-        # Execute automation pipeline
-        await sender._open_whatsapp()
-        await sender._search_and_select_contact(contact)
-        await sender._send_message(message)
-        
-        # Return to original position
-        await asyncio.to_thread(
-            pyautogui.moveTo, original_pos.x, original_pos.y, duration=0.1
-        )
-        
-        # Response based on mode
-        responses = {
-            "fast": f"⚡ Rapid delivery to '{contact}': \"{message}\"\n💡 Send another message?",
-            "balanced": f"✅ Message sent successfully to '{contact}': \"{message}\"\n🧠 Would you like to send another message?",
-            "reliable": f"🛡️ Reliably delivered to '{contact}': \"{message}\"\n🤖 Ready for next message command."
-        }
-        
-        success_response = responses.get(mode, responses["balanced"])
-        sender.logger.info(f"🎉 WhatsApp message sent successfully in {mode} mode")
-        return success_response
-        
-    except WhatsAppAutomationError as e:
-        error_msg = f"❌ WhatsApp automation failed: {str(e)}"
-        sender.logger.error(error_msg)
-        return error_msg
-        
-    except Exception as e:
-        error_msg = f"❌ Unexpected error in WhatsApp sending: {str(e)}"
-        sender.logger.error(error_msg)
-        return error_msg
+    return await asyncio.to_thread(_send_blocking, contact, message)
 
 
-# Backward compatibility - default mode is balanced
 @function_tool()
 async def send_whatsapp_message_advanced(contact: str, message: str) -> str:
-    """
-    Legacy support - uses balanced mode by default
-    """
-    return await send_whatsapp_message(contact, message, "balanced")
+    """Legacy alias of send_whatsapp_message."""
+    return await asyncio.to_thread(_send_blocking, contact, message)

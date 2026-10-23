@@ -17,9 +17,16 @@ __pycache__/
 # Runtime-generated app data
 *.db
 *.log
+*.log.*
+logs/
+service.json
 *.json
 !requirements*.json
 !package*.json
+
+# Session scratch / temp analysis scripts
+_*.py
+_*.log
 
 # OS/editor junk
 .DS_Store

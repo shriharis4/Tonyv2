@@ -66,10 +66,22 @@ async def perform_computer_action(
         return ok(f"Opened {path}")
 
     if action == "launch":
-        await loop.run_in_executor(
-            None, lambda: subprocess.Popen(f'start "" {detail}', shell=True)
-        )
-        return ok(f"Launched {detail}")
+        # Injection-safe launch (fixes D-16/H-13): never compose a shell
+        # string from model/user text. `os.startfile` resolves app names,
+        # file paths, and registered protocols without a shell; if it fails
+        # for a bare executable, fall back to Popen with an ARGV LIST
+        # (shell=False), so `detail` is always a single, un-split argument
+        # and cannot inject additional commands.
+        target = detail.strip().strip('"')
+        try:
+            await loop.run_in_executor(None, os.startfile, target)
+            return ok(f"Launched {target}")
+        except Exception:
+            try:
+                await loop.run_in_executor(None, lambda: subprocess.Popen([target]))
+                return ok(f"Launched {target}")
+            except Exception as e:
+                return fail(f"Could not launch '{target}'", detail=str(e))
 
     if action == "type":
         import pyautogui

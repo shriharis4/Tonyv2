@@ -12,9 +12,14 @@ faked here.
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
+
+# Keep test output out of the real runtime log (must be set before
+# core.runtime_agent is imported anywhere).
+os.environ.setdefault("TONY_LOG_FILE", "tony_test.log")
 
 import pytest
 
@@ -65,6 +70,8 @@ def runtime_agent(monkeypatch):
     ra.turn_ctx.last_spoken_text = ""
     ra.desktop_context["last_opened_app"] = None
     ra.desktop_context["last_referenced_file"] = None
+    ra._router_owned_turn_id = -1
+    ra._router_tool_started.clear()
 
     yield ra
 

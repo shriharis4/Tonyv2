@@ -384,11 +384,30 @@ class VoiceVisualizer(QWidget):
         self.state = "idle"
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.update_anim)
-        self.timer.start(30)
+        self.timer.start(60)  # LATENCY FIX: 15 FPS (was 30ms/33fps) — halves GIL contention
         self.waveform_data = [0.0] * 20
+
+    def hideEvent(self, event):
+        # Non-visual perf: stop driving repaints while this widget isn't
+        # visible so the 30fps animation doesn't keep the GIL busy and starve
+        # the agent thread's asyncio loop. Appearance while visible is
+        # unchanged. (Latency Item 2.)
+        try:
+            self.timer.stop()
+        except Exception:
+            pass
+        super().hideEvent(event)
+
+    def showEvent(self, event):
+        try:
+            if not self.timer.isActive():
+                self.timer.start(60)
+        except Exception:
+            pass
+        super().showEvent(event)
         
     def update_anim(self):
-        self.pulse_phase += 0.1
+        self.pulse_phase += 0.2  # doubled (was 0.1) to match halved 15 FPS rate
         if self.state == "listening":
             self.waveform_data = [random.uniform(0.1, 0.4) for _ in range(20)]
         elif self.state == "speaking":
@@ -705,8 +724,25 @@ class VoiceEngineWidget(QWidget):
         
         self.wave_timer = QTimer(self)
         self.wave_timer.timeout.connect(self.animate_waveform)
-        self.wave_timer.start(100)
+        self.wave_timer.start(150)  # LATENCY FIX: was 100ms — lower refresh, less GIL contention
         
+    def hideEvent(self, event):
+        # Non-visual perf: pause the waveform animation while hidden so it
+        # doesn't compete for the GIL with the agent loop. (Latency Item 2.)
+        try:
+            self.wave_timer.stop()
+        except Exception:
+            pass
+        super().hideEvent(event)
+
+    def showEvent(self, event):
+        try:
+            if not self.wave_timer.isActive():
+                self.wave_timer.start(150)
+        except Exception:
+            pass
+        super().showEvent(event)
+
     def animate_waveform(self):
         state = self.visualizer.state
         for bar in self.waveform_bars:
@@ -1078,14 +1114,40 @@ class CentralVisualizerCore(QWidget):
         
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.update_anim)
-        self.timer.start(33)  # 30 FPS is plenty for smooth pulsing, saves 50% CPU over 16ms
+        # LATENCY FIX: 15 FPS (66ms) instead of 30 FPS (33ms). This is the
+        # always-visible central pulse — the single biggest GIL contender
+        # with the agent thread's asyncio loop while the HUD is on screen.
+        # Halving the repaint rate halves that contention (the main remaining
+        # cause of speech->transcript latency). pulse_phase step is doubled
+        # below so the animation SPEED looks identical, just with fewer frames.
+        self.timer.start(66)
         
     def set_state(self, state):
         self.state = state.lower()
         
     def update_anim(self):
-        self.pulse_phase += 0.05
+        self.pulse_phase += 0.10  # doubled (was 0.05) to match the halved 15 FPS rate
         self.update()
+
+    def hideEvent(self, event):
+        # Non-visual perf: this is the always-on central TONY pulse — the
+        # single highest-value timer to pause when not visible (minimized/
+        # hidden), since it otherwise repaints ~30x/sec for the entire
+        # session and is the biggest GIL contender with the agent loop.
+        # Appearance while visible is unchanged. (Latency Item 2.)
+        try:
+            self.timer.stop()
+        except Exception:
+            pass
+        super().hideEvent(event)
+
+    def showEvent(self, event):
+        try:
+            if not self.timer.isActive():
+                self.timer.start(66)
+        except Exception:
+            pass
+        super().showEvent(event)
         
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -1563,6 +1625,21 @@ class ModernFloatingWindow(QMainWindow):
             f"color: {col}; font-family: 'Segoe UI'; font-size: 11px; font-weight: bold; border: none; background: transparent;"
         )
 
+    async def _start_audio_player(self):
+        """Create the speaker player ONCE, after the AEC mic, from the same
+        MediaDevices so Tony's output feeds the echo canceller. Attaches any
+        agent audio tracks that arrived before the player existed."""
+        if getattr(self, "player", None) is not None:
+            return
+        from livekit import rtc
+        if not hasattr(self, "devices"):
+            self.devices = rtc.MediaDevices()
+        self.player = self.devices.open_output()
+        await self.player.start()
+        for track in getattr(self, "_pending_audio_tracks", []):
+            asyncio.create_task(self.player.add_track(track))
+        self._pending_audio_tracks = []
+
     def _start_agent_background(self):
         def run_agent():
             try:
@@ -1619,15 +1696,28 @@ class ModernFloatingWindow(QMainWindow):
                                 .to_jwt()
                             self.client_room = rtc.Room()
                             
+                            # ECHO FIX: do NOT create the speaker player here.
+                            # LiveKit's echo canceller only works when the
+                            # output player is created AFTER open_input(
+                            # enable_aec=True) on the SAME MediaDevices, so it
+                            # can feed what Tony says into the canceller. The
+                            # old order (player first, mic later) meant AEC had
+                            # no speaker reference and cancelled nothing - the
+                            # mic heard Tony and Gemini answered itself. The
+                            # player is created right after the mic (step 4);
+                            # agent tracks that arrive earlier are queued.
                             self.devices = rtc.MediaDevices()
-                            self.player = self.devices.open_output()
-                            await self.player.start()
+                            self.player = None
+                            self._pending_audio_tracks = []
                             
                             @self.client_room.on("track_subscribed")
                             def on_track_subscribed(track: rtc.Track, publication, participant):
                                 if track.kind == rtc.TrackKind.KIND_AUDIO:
                                     print(f"[AUDIO] Subscribed to agent audio track: {track.sid}")
-                                    asyncio.create_task(self.player.add_track(track))
+                                    if self.player is None:
+                                        self._pending_audio_tracks.append(track)
+                                    else:
+                                        asyncio.create_task(self.player.add_track(track))
                             
                             @self.client_room.on("data_received")
                             def on_data_received(dp: rtc.DataPacket):
@@ -1745,6 +1835,11 @@ class ModernFloatingWindow(QMainWindow):
                         self.mic = self.devices.open_input(input_device=selected_idx, enable_aec=True, noise_suppression=True, queue_capacity=500)
                         print("[MIC] READY")
                         print("[AUDIO] input stream opened")
+                        # ECHO FIX: speaker player created AFTER the AEC mic,
+                        # from the same MediaDevices, so Tony's own voice is
+                        # fed to the echo canceller and removed from the mic.
+                        await self._start_audio_player()
+                        print("[AUDIO] echo cancellation linked to speaker output")
                         self.bridge.mic_status_changed.emit("MIC: ONLINE", "color: #00ff00; font-family: 'Segoe UI'; font-size: 10px; font-weight: bold; background: transparent; border: none;")
                         mic_ok = True
                         
@@ -1758,6 +1853,10 @@ class ModernFloatingWindow(QMainWindow):
                     except Exception as e:
                         print(f"[MIC ERROR] {e}")
                         self.bridge.mic_status_changed.emit("MIC: OFFLINE", "color: #ff0055; font-family: 'Segoe UI'; font-size: 10px; font-weight: bold; background: transparent; border: none;")
+                        try:
+                            await self._start_audio_player()  # still play Tony's voice
+                        except Exception as pe:
+                            print(f"[AUDIO ERROR] {pe}")
 
                     if livekit_ok and gemini_ok and mic_ok:
                         print("[SESSION] Starting agent session...")

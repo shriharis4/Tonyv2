@@ -2,27 +2,39 @@ import sys
 import builtins
 import logging
 import logging.handlers
+import queue as _queue_mod
 import os as _os_for_log
 from pathlib import Path as _PathForLog
 
 # =========================
-# GLOBAL PRINT -> ROTATING LOG FILE BRIDGE
+# GLOBAL PRINT -> ROTATING LOG FILE BRIDGE (non-blocking)
 # =========================
-# Every print() call across the whole app (runtime_agent.py AND every
-# Tools/*.py module, since builtins.print is patched process-wide) is
-# mirrored to a rotating log file. This gives persistent, structured logs
-# for post-hoc debugging without requiring call-site-by-call-site
-# migration of ~140+ existing print() statements, while still printing to
-# the console for live debugging.
+# Every print() call across the whole app is mirrored to a rotating log
+# file. To keep this OFF the event loop's hot path (there are ~12-20
+# prints per turn, each previously doing a synchronous disk write that
+# added up and compounded latency), the file write is done by a background
+# QueueListener thread: print() just enqueues (microseconds), the listener
+# flushes to disk off-thread.
 _LOG_DIR = _PathForLog(__file__).resolve().parents[1] / "logs"
 _LOG_DIR.mkdir(exist_ok=True)
+# Tests set TONY_LOG_FILE so they never write into (or rotate away) the real
+# runtime log that latency diagnosis depends on.
 _file_log_handler = logging.handlers.RotatingFileHandler(
-    _LOG_DIR / "tony.log", maxBytes=5 * 1024 * 1024, backupCount=5, encoding="utf-8"
+    _LOG_DIR / _os_for_log.environ.get("TONY_LOG_FILE", "tony.log"),
+    maxBytes=5 * 1024 * 1024, backupCount=5, encoding="utf-8"
 )
 _file_log_handler.setFormatter(logging.Formatter("%(asctime)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+
+# Bounded queue: if logging ever falls behind, drop rather than grow
+# unbounded (a dropped debug line is harmless; a growing queue is not).
+_log_queue = _queue_mod.Queue(maxsize=10000)
+_queue_handler = logging.handlers.QueueHandler(_log_queue)
+_log_listener = logging.handlers.QueueListener(_log_queue, _file_log_handler, respect_handler_level=True)
+_log_listener.start()
+
 _file_logger = logging.getLogger("tony.console")
 _file_logger.setLevel(logging.INFO)
-_file_logger.addHandler(_file_log_handler)
+_file_logger.addHandler(_queue_handler)
 _file_logger.propagate = False
 
 # Safe print wrapper to prevent UnicodeEncodeError on legacy Windows consoles
@@ -42,7 +54,12 @@ def print(*args, **kwargs):
     _original_print(*new_args, **kwargs)
     try:
         sep = kwargs.get('sep', ' ')
-        _file_logger.info(sep.join(str(a) for a in new_args))
+        # Non-blocking enqueue; if the queue is full (logging backed up),
+        # drop the line rather than block the event loop.
+        try:
+            _file_logger.info(sep.join(str(a) for a in new_args))
+        except _queue_mod.Full:
+            pass
     except Exception:
         pass  # Logging must never break the app's console output.
 
@@ -92,9 +109,79 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # =========================
+# SESSION-SCOPED MEMORY DB (Item 5)
+# =========================
+# Each run gets a fresh, uniquely-named conversations DB so chat history
+# does not accumulate across runs. The persistent latency history
+# (turn_timings) lives in a SEPARATE file (tony_perf_history.db, handled
+# inside MemoryDatabase) that is NEVER deleted — so the diagnostic
+# capability survives even though per-session chat history does not.
+import uuid as _uuid
+import atexit as _atexit
+
+_SESSION_DB_PREFIX = "tony_memory_session_"
+
+
+def _new_session_db_path() -> Path:
+    """A fresh, uniquely-named per-session conversations DB in PROJECT_ROOT."""
+    session_id = _uuid.uuid4().hex[:8]
+    return PROJECT_ROOT / f"{_SESSION_DB_PREFIX}{session_id}.db"
+
+
+def _sweep_orphaned_session_dbs(keep: Path = None) -> None:
+    """Delete leftover per-session DBs from previous runs that did not clean
+    up after themselves (crash/kill). Called once at startup BEFORE creating
+    this run's DB so these never silently accumulate on disk. `keep` (if
+    given) is never deleted."""
+    try:
+        for p in PROJECT_ROOT.glob(f"{_SESSION_DB_PREFIX}*.db"):
+            if keep is not None and p.resolve() == keep.resolve():
+                continue
+            try:
+                p.unlink()
+                print(f"[SESSION-DB] Swept orphaned session DB: {p.name}")
+            except Exception as _e:
+                print(f"[SESSION-DB] Could not remove {p.name}: {_e}")
+    except Exception as _e:
+        print(f"[SESSION-DB] Orphan sweep failed: {_e}")
+
+
+# Established once at startup (in entrypoint). Until then, callers fall back
+# to this module-level handle.
+session_db_path: Path = None
+
+
+def _get_session_db_path() -> Path:
+    """Return the current session's conversations DB path, creating/sweeping
+    on first use so any MemoryDatabase() opened during a turn uses the
+    session file rather than the old fixed tony_memory.db."""
+    global session_db_path
+    if session_db_path is None:
+        session_db_path = _new_session_db_path()
+        _sweep_orphaned_session_dbs(keep=session_db_path)
+        # Register cleanup for clean shutdown. Orphan sweep on the NEXT run
+        # covers the unclean-exit case where this never fires.
+        _atexit.register(lambda: _cleanup_session_db(session_db_path))
+        print(f"[SESSION-DB] Using session DB: {session_db_path.name}")
+    return session_db_path
+
+
+def _cleanup_session_db(path: Path) -> None:
+    """Delete this session's conversations DB on clean shutdown. The
+    persistent perf DB (tony_perf_history.db) is deliberately NOT touched."""
+    try:
+        if path is not None:
+            Path(path).unlink(missing_ok=True)
+            print(f"[SESSION-DB] Cleaned up session DB: {Path(path).name}")
+    except Exception as _e:
+        print(f"[SESSION-DB] Cleanup failed: {_e}")
+
+
+# =========================
 # LIVEKIT IMPORTS
 # =========================
 from livekit import agents, rtc
+from livekit.agents import function_tool
 from livekit.agents import Agent, AgentSession, RoomInputOptions
 from livekit.plugins import noise_cancellation
 from livekit.plugins import silero
@@ -201,6 +288,7 @@ from tool_registry import (
 )
 from Tools.tool_result import ok as tool_ok, fail, is_failure
 from core.logging_config import get_logger, log_turn_outcome
+from core.textnorm import normalize_transcript
 
 router_logger = get_logger("router")
 tool_logger = get_logger("tool")
@@ -292,12 +380,27 @@ def update_gui_command(command: str):
 # PARTIAL TRANSCRIPT — same bubble updates as user speaks, then finalizes
 # -----------------------------------------------------------------------
 _partial_transcript_open = False
+# Throttle interim partial-transcript GUI publishes. Each publish schedules
+# a LiveKit publish_data coroutine onto the AGENT event loop; a long
+# utterance emits many interim partials, so publishing every one adds
+# avoidable work on the hot loop during the exact speech->transcript window.
+# ~8 updates/sec is visually indistinguishable from 30/sec for a live
+# caption. The FINAL transcript is never throttled.
+_last_partial_pub_at = 0.0
+_PARTIAL_MIN_INTERVAL_S = 0.12
 
 def update_gui_partial_transcript(text: str, is_final: bool):
     """Show partial STT transcript in-place; create one bubble until is_final."""
-    global _partial_transcript_open
+    global _partial_transcript_open, _last_partial_pub_at
     if not text or not text.strip():
         return
+    text = normalize_transcript(text)  # English letters only in the bubble
+    # Coalesce interim updates (but always let the final through).
+    if not is_final:
+        _now = time.perf_counter()
+        if (_now - _last_partial_pub_at) < _PARTIAL_MIN_INTERVAL_S:
+            return
+        _last_partial_pub_at = _now
     has_stream = (
         _gui_callbacks.get('stream_start') and
         _gui_callbacks.get('stream_replace') and
@@ -346,6 +449,9 @@ def update_gui_response(response: str):
     """Stream the response word-by-word to the GUI chat bubble."""
     if not response or not response.strip():
         return
+    # ENGLISH-ONLY DISPLAY: Gemini sometimes replies in Hindi/Devanagari.
+    # Transliterate anything non-Latin so bubbles always show English letters.
+    response = normalize_transcript(response)
 
     _cancel_pending_stream()
 
@@ -415,57 +521,74 @@ def update_gui_mic_status(status: str):
 
 
 # =========================
-# TOOL TIMING DECORATOR
 # =========================
-def make_timing_decorator(func):
-    if asyncio.iscoroutinefunction(func):
-        @functools.wraps(func)
-        async def async_wrapper(*args, **kwargs):
-            global turn_ctx
-            my_turn_id = turn_ctx.turn_id
-            tool_name = func.__name__
-            print(f"[TOOL] {tool_name} started (Turn {my_turn_id})")
-            start_time = time.perf_counter()
+# GEMINI TOOL WRAPPER
+# =========================
+# Tool name -> perf_counter() when the DIRECT ROUTER last started it. Gemini
+# hears the same audio as the router and often calls the same tool in
+# parallel; if the router already ran it for this command, Gemini's call is
+# skipped. Prevents double execution (observed: two WhatsApp sends typing
+# "bro hi" and "Bro hi" at once -> "Bbrroohhii" in the search box).
+_router_tool_started: Dict[str, float] = {}
+_ROUTER_DUP_WINDOW_S = 6.0
+# turn_id the direct router has claimed (set in _abort_model_turn, which every
+# router intent calls when it takes a command, and for noise/duplicates).
+# Gemini tool calls on that same turn are skipped, whichever tool they pick
+# (observed 11:23: router closed the tab AND Gemini ran perform_computer_action).
+_router_owned_turn_id = -1
+
+
+def make_timing_decorator(tool):
+    """Wrap a tool for Gemini's native tool calls so that it:
+      * really awaits the tool (the old wrapper treated livekit FunctionTool
+        objects as sync, returned an un-awaited coroutine in 0.00s and let
+        the work run untracked, outside the input lock),
+      * runs under the same _input_lock / timeout / crash isolation as the
+        router (execute_tool), so two tools never type at the same time,
+      * is skipped if the router already started the same tool moments ago,
+      * keeps the original name/description/signature for Gemini's schema."""
+    inner = getattr(tool, "_func", None) or tool
+    info = getattr(tool, "info", None)
+    name = getattr(info, "name", None) or getattr(inner, "__name__", "tool")
+    description = getattr(info, "description", None) or (inner.__doc__ or "")
+
+    @functools.wraps(inner)
+    async def gemini_tool_wrapper(*args, **kwargs):
+        global _tool_executing
+        if turn_ctx.turn_id == _router_owned_turn_id:
+            # Race guard: Gemini's call for a NEW command can arrive a moment
+            # before our transcript handler opens the new turn. Give it up to
+            # 1s; if a new turn starts and the router doesn't claim it, this
+            # call belongs to the new command and may run.
+            for _ in range(10):
+                await asyncio.sleep(0.1)
+                if turn_ctx.turn_id != _router_owned_turn_id:
+                    break
+        if turn_ctx.turn_id == _router_owned_turn_id:
+            print(f"[TOOL] Gemini call to {name} skipped - router already handled this command")
+            return ("The user's latest command was already handled. Do not call any tool; "
+                    "just briefly confirm in English.")
+        started = _router_tool_started.get(name)
+        if started is not None and (time.perf_counter() - started) < _ROUTER_DUP_WINDOW_S:
+            print(f"[TOOL] Gemini call to {name} skipped - router already ran it for this command")
+            return (f"'{name}' was already executed for the user's latest command. "
+                    "Do not call it again; just briefly confirm.")
+        my_turn_id = turn_ctx.turn_id
+        print(f"[TOOL] Gemini -> {name} started (Turn {my_turn_id})")
+        start_time = time.perf_counter()
+        async with _input_lock:
+            _tool_executing = True
             try:
-                res = await func(*args, **kwargs)
-                duration = time.perf_counter() - start_time
-                if turn_ctx.turn_id != my_turn_id:
-                    print(f"[TOOL] {tool_name} completed but turn changed ({my_turn_id} -> {turn_ctx.turn_id}). Suppressing result.")
-                    return "Task cancelled because the user interrupted with a new command. Do not mention this cancellation, just respond to the user's latest command."
-                print(f"[TOOL] {tool_name} completed: {duration:.2f}s")
-                return res
-            except Exception as e:
-                duration = time.perf_counter() - start_time
-                if turn_ctx.turn_id != my_turn_id:
-                    print(f"[TOOL] {tool_name} failed but turn changed. Suppressing.")
-                    return "Task cancelled due to interruption."
-                print(f"[TOOL] {tool_name} failed after {duration:.2f}s: {e}")
-                raise e
-        return async_wrapper
-    else:
-        @functools.wraps(func)
-        def sync_wrapper(*args, **kwargs):
-            global turn_ctx
-            my_turn_id = turn_ctx.turn_id
-            tool_name = func.__name__
-            print(f"[TOOL] {tool_name} started (Turn {my_turn_id})")
-            start_time = time.perf_counter()
-            try:
-                res = func(*args, **kwargs)
-                duration = time.perf_counter() - start_time
-                if turn_ctx.turn_id != my_turn_id:
-                    print(f"[TOOL] {tool_name} completed but turn changed. Suppressing result.")
-                    return "Task cancelled because the user interrupted with a new command. Do not mention this cancellation, just respond to the user's latest command."
-                print(f"[TOOL] {tool_name} completed: {duration:.2f}s")
-                return res
-            except Exception as e:
-                duration = time.perf_counter() - start_time
-                if turn_ctx.turn_id != my_turn_id:
-                    print(f"[TOOL] {tool_name} failed but turn changed. Suppressing.")
-                    return "Task cancelled due to interruption."
-                print(f"[TOOL] {tool_name} failed after {duration:.2f}s: {e}")
-                raise e
-        return sync_wrapper
+                res = await execute_tool(inner, *args, **kwargs)
+            finally:
+                _tool_executing = False
+        print(f"[TOOL] Gemini -> {name} completed: {time.perf_counter() - start_time:.2f}s")
+        if turn_ctx.turn_id != my_turn_id:
+            return ("Task cancelled because the user interrupted with a new command. "
+                    "Do not mention this cancellation, just respond to the user's latest command.")
+        return res
+
+    return function_tool(gemini_tool_wrapper, name=name, description=description)
 
 
 # =========================
@@ -523,6 +646,12 @@ class TurnTimer:
         
         global latency_history
         latency_history.append(total_latency)
+        # Cap to a rolling window so (a) the list never grows unbounded and
+        # (b) the O(n) average recompute below stays O(1)-ish, and the GUI
+        # "AVERAGE" reflects RECENT performance rather than being dragged by
+        # ancient turns. Fixes a slow per-turn growth in cost.
+        if len(latency_history) > 50:
+            latency_history = latency_history[-50:]
         avg_latency = sum(latency_history) / len(latency_history)
         update_gui_latency(total_latency, avg_latency)
 
@@ -547,7 +676,7 @@ def _persist_turn_timing(timer, total_latency: float) -> None:
     global _timing_db
     if _timing_db is None:
         from memory_db import MemoryDatabase
-        _timing_db = MemoryDatabase()
+        _timing_db = MemoryDatabase(db_path=str(_get_session_db_path()))
 
     def _seg(a, b):
         return (b - a) if (a and b) else None
@@ -591,6 +720,11 @@ class TurnContext:
         # the router sets this instead of executing immediately, and only
         # fires on an explicit affirmative reply within the time window.
         self.pending_confirmation = None  # {"action": str, "handler": callable, "requested_at": float}
+        # Pending slot-fill: when a skill was invoked with a missing slot
+        # (e.g. WhatsApp contact given but no message), the NEXT utterance is
+        # consumed as that slot's value instead of being re-routed. Fixes the
+        # "re-asks after you already answered" screenshot symptom (S4).
+        self.pending_slot = None  # {"skill": str, "contact": str, "handler": callable, "requested_at": float}
         
     def next_turn(self):
         self.turn_id += 1
@@ -602,6 +736,22 @@ class TurnContext:
 
 turn_ctx = TurnContext()
 active_timeout_task = None
+# Tracks the in-flight handle_user_transcript task so a NEW transcript can
+# cancel the PREVIOUS turn's task instead of letting orphaned tasks pile up
+# (each would otherwise queue on _input_lock and compound latency over time).
+_active_turn_task = None
+# Global input lock: serializes any tool that moves focus / mouse / keyboard
+# so two tasks can never interleave keystrokes (fixes the overlap bug where a
+# WhatsApp send and an Edge search ran at the same time, corrupting both).
+_input_lock = asyncio.Lock()
+# True only while a tool is actively running inside the input lock. Used to
+# avoid cancelling a turn that is mid-keyboard/mouse automation — cancelling
+# the asyncio task would NOT stop the running executor thread, it would just
+# orphan it (thread keeps driving input in the background). Those orphans
+# accumulated over several commands and progressively wedged the assistant
+# ("stuck in idle after 4-5 tasks"). The fast MJ original never cancels
+# in-flight work; this mirrors that.
+_tool_executing = False
 is_speaking_locally = False
 last_local_speech_end = 0.0
 
@@ -609,6 +759,141 @@ def _normalize_command(text: str) -> str:
     if not text:
         return ""
     return re.sub(r"\s+", " ", text.strip().lower())
+
+
+# Explicit noise/non-speech markers some STT backends emit for background
+# sound, coughs, clicks, etc. Matched case-insensitively as whole tokens.
+_NOISE_MARKERS = {
+    "noise", "silence", "inaudible", "unintelligible", "blank_audio",
+    "background noise", "music", "sound",
+}
+_NOISE_MARKER_RE = re.compile(
+    r"^[\[\(<]?\s*(" + "|".join(re.escape(m) for m in _NOISE_MARKERS) + r")\s*[\]\)>]?$",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_noise(text: str) -> bool:
+    """Return True when a FINAL transcript is almost certainly VAD-triggered
+    noise rather than a real command, so it can be dropped BEFORE routing.
+
+    Deliberately conservative — it only rejects transcripts that cannot be a
+    real command, so genuine short commands ("open chrome", "close chrome")
+    always pass:
+      * empty / whitespace-only,
+      * pure punctuation/symbols with no alphanumerics (".", "...", "?"),
+      * explicit noise markers ("<noise>", "[inaudible]", "(music)"),
+      * a single stray alphabetic character (a lone "a"/"d"/"k" blip) with
+        nothing else of substance.
+
+    It does NOT judge by word count or by how "garbled" multi-word text is —
+    reducing those at the source is the VAD sensitivity's job, and over-
+    filtering here would risk dropping real (if mis-transcribed) commands.
+    """
+    if not text:
+        return True
+    stripped = text.strip()
+    if not stripped:
+        return True
+    # Explicit non-speech marker tokens.
+    if _NOISE_MARKER_RE.match(stripped):
+        return True
+    # No alphanumeric content at all -> punctuation/symbol noise.
+    alnum = re.sub(r"[^0-9a-zA-Z\u00C0-\u024F]", "", stripped)
+    if not alnum:
+        return True
+    # A single lone alphabetic character is never a real command.
+    if len(alnum) == 1 and alnum.isalpha():
+        return True
+    return False
+
+
+# How long after Tony's own TTS finishes we keep watching for the mic
+# re-capturing the tail of that speech as if it were a user command. Kept
+# SHORT so it cannot swallow the user's genuine next command.
+ECHO_WINDOW_S = 0.5
+
+
+def _echo_ratio(a: str, b: str) -> float:
+    """Near-exact similarity between two strings (full-sequence ratio only).
+
+    IMPORTANT: this deliberately does NOT use token-overlap. An earlier
+    token-overlap version dropped REAL commands that merely shared common
+    words with Tony's last sentence (e.g. Tony said "closing whatsapp",
+    user said "close the spotify window" -> shared close/the/window -> was
+    wrongly discarded as echo), which made Tony appear stuck in idle. Echo
+    is only flagged when the transcript is nearly identical to what Tony
+    actually said."""
+    a = (a or "").strip().lower()
+    b = (b or "").strip().lower()
+    if not a or not b:
+        return 0.0
+    return difflib.SequenceMatcher(None, a, b).ratio()
+
+
+def _is_self_echo(normalized: str, now: float, awaiting_slot: bool) -> bool:
+    """Return True ONLY when a transcript is almost certainly Tony's OWN
+    spoken output re-captured by the mic — i.e. nearly identical to what
+    Tony just said, within a short window of that speech.
+
+    This is intentionally conservative. Dropping a real command (false
+    positive) makes Tony look frozen/idle, which is far worse than letting
+    one rare garbled echo through. So:
+      * require NEAR-EXACT similarity (>= 0.85), not fuzzy/token overlap,
+      * only within a SHORT window (while speaking, or <0.5s after),
+      * NEVER while awaiting a slot-fill answer,
+      * a safety floor: never drop a transcript of 4+ words (a genuine
+        multi-word command is essentially never a mis-captured echo at
+        >=0.85 unless it truly matches, which the ratio already checks).
+    """
+    spoken = turn_ctx.last_spoken_text
+    if not spoken:
+        return False
+    if awaiting_slot:
+        return False
+    in_window = is_speaking_locally or (
+        last_local_speech_end and (now - last_local_speech_end) < ECHO_WINDOW_S
+    )
+    if not in_window:
+        return False
+    if _echo_ratio(normalized, spoken) >= 0.85:
+        return True
+    return False
+
+
+_WA_PREFIX_RE = re.compile(
+    r'^(?:(?:please\s+)?(?:open|launch|start|go\s+to)\s+)?whatsapp\s+(?:and|then)\s+'
+)
+_WA_SEND_RE = re.compile(
+    r'(?:send\s+(?:a\s+)?(?:whatsapp\s+)?(?:message|msg|text)|message|text|whatsapp|msg)\s+'
+    r'(?:to\s+|on\s+whatsapp\s+to\s+)?'
+    r'(?!(?:and|send|message|to)\b)([a-z][\w .]*?)\s+(?:saying|that|:|-)\s+(.+)'
+)
+_WA_HINGLISH_RE = re.compile(r'([a-z][\w ]*?)\s+ko\s+(.+?)\s+(?:bhej[o]?|bol\s*do|send\s*karo)')
+_WA_CONTACT_ONLY_RE = re.compile(
+    r'^(?:send\s+(?:a\s+)?(?:whatsapp\s+)?(?:message|msg|text)|message|text)\s+(?:to\s+)?([a-z][\w .]*?)\s*$'
+)
+
+
+def _extract_whatsapp_send(cmd: str):
+    """Return (contact, message) for a WhatsApp send command, (contact, None)
+    when the message is missing (slot-fill), or (None, None) if this is not a
+    send command. Strips a leading 'open/launch whatsapp and' so combined
+    commands route to SEND instead of being swallowed by the open-app intent
+    (observed: 'open whatsapp and send message to bro saying hi' only opened
+    WhatsApp and never sent)."""
+    c = _WA_PREFIX_RE.sub('', cmd.strip())
+    m = _WA_SEND_RE.search(c)
+    if m:
+        return m.group(1).strip(), m.group(2).strip()
+    m = _WA_HINGLISH_RE.search(c)
+    if m:
+        return m.group(1).strip(), m.group(2).strip()
+    m = _WA_CONTACT_ONLY_RE.search(c)
+    if m:
+        return m.group(1).strip(), None
+    return None, None
+
 
 async def execute_tool(func, *args, **kwargs):
     """
@@ -652,6 +937,8 @@ async def execute_tool(func, *args, **kwargs):
 
 def _abort_model_turn(session: AgentSession) -> None:
     """Stop Gemini from also acting on a turn that the direct router already handled."""
+    global _router_owned_turn_id
+    _router_owned_turn_id = turn_ctx.turn_id
     try:
         session.interrupt(force=True)
     except Exception:
@@ -702,18 +989,26 @@ async def speak_local(session: AgentSession, text: str):
     asyncio.create_task(speak_local_background(session, text))
 
 async def speak_local_background(session: AgentSession, text: str):
-    global is_speaking_locally
+    global is_speaking_locally, last_local_speech_end
     print("[TTS] response started using Google API / LiveKit")
     print("[AUDIO OUT] audio playback started")
-    
+
     try:
-        await session.say(text)
+        # Bound session.say() with a timeout so it can NEVER hang (D-20: with
+        # a Realtime speech-to-speech model, say() can stall/stay silent). If
+        # it hangs, is_speaking_locally would otherwise stay True forever and
+        # every subsequent command would be silently dropped by the
+        # on_user_transcript guard -> "sits idle, not performing after a few
+        # tasks". The finally below guarantees the flag is always cleared.
+        await asyncio.wait_for(session.say(text), timeout=12.0)
+    except asyncio.TimeoutError:
+        print("[TTS] session.say timed out - clearing speaking state")
     except Exception as e:
-        print(f"⚠️ Cloud speech failed: {e}")
-                
-    is_speaking_locally = False
-    global last_local_speech_end
-    last_local_speech_end = time.perf_counter()
+        print(f"[TTS] Cloud speech failed: {e}")
+    finally:
+        is_speaking_locally = False
+        last_local_speech_end = time.perf_counter()
+
     print("[TTS] response finished")
     print("[AUDIO OUT] audio playback finished")
     timer = get_or_create_timer()
@@ -792,6 +1087,30 @@ async def route_command_directly(session: AgentSession, command: str) -> bool:
             await speak_local(session, f"Okay, cancelled. I will not {pending['action']}.")
             return True
 
+    # --- SLOT-FILL CONSUMER ---
+    # If a skill is waiting for a missing slot (e.g. WhatsApp message body),
+    # this utterance IS the answer. Consume it directly instead of
+    # re-routing (which previously made Tony re-ask). 30s expiry; "cancel"
+    # aborts.
+    if turn_ctx.pending_slot:
+        slot = turn_ctx.pending_slot
+        turn_ctx.pending_slot = None
+        expired = (time.perf_counter() - slot.get("requested_at", 0)) > 30.0
+        if expired:
+            print(f"[ROUTER] pending slot for {slot.get('skill')} expired")
+        elif re.fullmatch(r'\s*(cancel|never\s*mind|rehne\s*do|nahi|stop)\s*', clean_command):
+            _abort_model_turn(session)
+            await speak_local(session, "Okay, cancelled.")
+            return True
+        else:
+            # Treat the whole utterance as the slot value; strip a leading
+            # "saying/say/that" if the user repeated it.
+            body = re.sub(r'^(?:saying|say|that|tell (?:him|her|them))\s+', '', clean_command).strip()
+            print(f"[ROUTER] slot-fill: sending pending {slot.get('skill')} with body='{body}'")
+            _abort_model_turn(session)
+            await slot["handler"](body=body)
+            return True
+
     print(f"[ROUTER] Checking direct command: '{clean_command}'")
     timer = get_or_create_timer()
     
@@ -799,7 +1118,19 @@ async def route_command_directly(session: AgentSession, command: str) -> bool:
         timer.t7 = time.perf_counter()
         tool_name = getattr(func, "__name__", "unknown_tool")
         print(f"[T7] tool started: {tool_name}")
-        res = await execute_tool(func, *args, **kwargs)
+        _tname = getattr(getattr(func, "info", None), "name", None) or tool_name
+        _router_tool_started[_tname] = time.perf_counter()
+        # Serialize via the global input lock so no two tools drive the
+        # keyboard/mouse/focus at the same time (fixes the WhatsApp+search
+        # overlap). The lock is released as soon as this tool finishes, so a
+        # following command simply waits its turn instead of interleaving.
+        global _tool_executing
+        async with _input_lock:
+            _tool_executing = True
+            try:
+                res = await execute_tool(func, *args, **kwargs)
+            finally:
+                _tool_executing = False
         timer.t8 = time.perf_counter()
         print(f"[T8] tool completed: {tool_name}")
         log_turn_outcome(clean_command, "direct_router", tool_name, not is_failure(res) if isinstance(res, str) else True,
@@ -864,7 +1195,14 @@ async def route_command_directly(session: AgentSession, command: str) -> bool:
         return True
 
     # 1. CHECK FOR MULTI-STEP COMMANDS
-    if any(sep in clean_command for sep in [" then ", " and ", ","]):
+    # Guard (fixes D-10): do NOT split when the command carries a free-text
+    # payload where "and"/"," are content, not clause separators — message
+    # sends ("send message to X saying A and B"), writing/typing content
+    # ("write ... and ..."), or anything with a "saying/that" payload.
+    # Splitting these corrupted the message/content and caused the
+    # WhatsApp-send to run as a separate overlapping step.
+    _has_payload = bool(re.search(r'\b(saying|that|message|whatsapp|text|write|type|email|note)\b', clean_command))
+    if (not _has_payload) and any(sep in clean_command for sep in [" then ", " and ", ","]):
         sub_cmds = []
         parts = re.split(r'\b(?:and|then)\b|,', clean_command)
         verbs = ["open", "launch", "start", "close", "exit", "set", "increase", "decrease", "take", "capture", "search", "play", "type", "press", "create", "find", "read", "summarize", "message"]
@@ -920,6 +1258,35 @@ async def route_command_directly(session: AgentSession, command: str) -> bool:
             return True
 
     try:
+        # WhatsApp send — checked FIRST so combined "open whatsapp and send
+        # message to X saying Y" is never swallowed by open-app/time/etc.
+        wa_contact, wa_msg = _extract_whatsapp_send(clean_command)
+        if wa_contact and wa_msg:
+            print(f"[ROUTER] Direct command matched: send_whatsapp_message({wa_contact}, {wa_msg})")
+            _abort_model_turn(session)
+            res = await run_tool_helper(send_whatsapp_message, wa_contact, wa_msg)
+            if isinstance(res, str) and is_failure(res):
+                await speak_local(session, f"Sorry, I couldn't send the message to {wa_contact}.")
+            else:
+                await speak_local(session, f"Message sent to {wa_contact}.")
+            return True
+        if wa_contact and not wa_msg:
+            print(f"[ROUTER] WhatsApp slot-fill: need message for {wa_contact}")
+            _abort_model_turn(session)
+
+            async def _send_pending_wa(contact=wa_contact, body=None):
+                await run_tool_helper(send_whatsapp_message, contact, body)
+                await speak_local(session, f"Message sent to {contact}.")
+
+            turn_ctx.pending_slot = {
+                "skill": "whatsapp_send",
+                "contact": wa_contact,
+                "handler": _send_pending_wa,
+                "requested_at": time.perf_counter(),
+            }
+            await speak_local(session, f"What should I say to {wa_contact}?")
+            return True
+
         # Greetings / Wake word response
         if clean_command in ["hello", "hi", "hey", "hello tony", "hey tony", "tony", "yo"]:
             print(f"[ROUTER] Direct command matched: greeting")
@@ -933,10 +1300,7 @@ async def route_command_directly(session: AgentSession, command: str) -> bool:
             now_str = datetime.now().strftime("%I:%M %p")
             print(f"[ROUTER] Direct command matched: time -> {now_str}")
             _abort_model_turn(session)
-            if any(x in clean_command for x in ["टाइम", "समय", "samay", "बजे", "baje"]):
-                await speak_local(session, f"अभी {now_str} हो रहा है।")
-            else:
-                await speak_local(session, f"It's {now_str}.")
+            await speak_local(session, f"It's {now_str}.")
             return True
 
         # Date (English & Hindi / Hinglish)
@@ -944,10 +1308,7 @@ async def route_command_directly(session: AgentSession, command: str) -> bool:
             today_str = datetime.now().strftime("%A, %B %d, %Y")
             print(f"[ROUTER] Direct command matched: date -> {today_str}")
             _abort_model_turn(session)
-            if any(x in clean_command for x in ["तारीख", "tarikh", "दिन", "din"]):
-                await speak_local(session, f"आज की तारीख {datetime.now().strftime('%d %B %Y')} है।")
-            else:
-                await speak_local(session, f"Today is {today_str}.")
+            await speak_local(session, f"Today is {today_str}.")
             return True
 
         # Copy & Paste
@@ -1057,10 +1418,7 @@ async def route_command_directly(session: AgentSession, command: str) -> bool:
                 print(f"[ROUTER] Direct command matched: manage_window(close, {close_target})")
                 _abort_model_turn(session)
                 await run_tool_helper(manage_window, "close", close_target)
-                if any(x in clean_command for x in ["बंद", "band", "क्लोज"]):
-                    await speak_local(session, f"{close_target} बंद कर दिया गया है।")
-                else:
-                    await speak_local(session, f"Closing {close_target}.")
+                await speak_local(session, f"Closing {close_target}.")
                 return True
 
         # Open Applications (English, Hindi, Hinglish, Reverse syntax)
@@ -1111,10 +1469,7 @@ async def route_command_directly(session: AgentSession, command: str) -> bool:
                     except Exception:
                         pass
                     desktop_context["last_opened_app"] = "recycle bin"
-                    if "रिसाइकल" in clean_command:
-                        await speak_local(session, "रिसाइकल बिन खोल दिया गया है।")
-                    else:
-                        await speak_local(session, "Opening Recycle Bin.")
+                    await speak_local(session, "Opening Recycle Bin.")
                 elif open_target == "spotify":
                     await run_tool_helper(open_spotify)
                     desktop_context["last_opened_app"] = "spotify"
@@ -1233,16 +1588,8 @@ async def route_command_directly(session: AgentSession, command: str) -> bool:
             await speak_local(session, f"Folder {folder_name} created.")
             return True
 
-        # WhatsApp Messaging
-        wa_match = re.search(r'(?:message|whatsapp)\s+(\w+)\s+(?:saying|that)\s+(.+)', clean_command)
-        if wa_match:
-            name = wa_match.group(1)
-            msg = wa_match.group(2)
-            print(f"[ROUTER] Direct command matched: send_whatsapp_message({name}, {msg})")
-            _abort_model_turn(session)
-            await run_tool_helper(send_whatsapp_message, name, msg)
-            await speak_local(session, f"Message sent to {name}.")
-            return True
+        # (WhatsApp send is handled at the top of the router via
+        # _extract_whatsapp_send.)
 
         # YouTube Media Searches
         if "youtube" in clean_command:
@@ -1257,16 +1604,41 @@ async def route_command_directly(session: AgentSession, command: str) -> bool:
                 await speak_local(session, f"Playing {query} on YouTube.")
                 return True
 
-        # Spotify Playbacks
-        if "spotify" in clean_command or "music" in clean_command or "song" in clean_command or clean_command in ["play", "pause", "next", "previous", "skip", "go back"]:
+        # Spotify Playbacks (fixes D-01/3.1)
+        if "spotify" in clean_command or "music" in clean_command or "song" in clean_command or clean_command in ["play", "pause", "next", "previous", "skip", "go back", "resume"]:
+            # First, try to extract a named track: "play X on spotify" /
+            # "play X" (where X is a real entity, not a filler word).
+            m = re.search(r'\bplay\s+(.+?)(?:\s+on\s+spotify)?$', clean_command)
+            named_query = None
+            if m:
+                candidate = m.group(1).strip()
+                # Strip a leading "spotify" if the phrasing was "play spotify X"
+                candidate = re.sub(r'^(?:on\s+)?spotify\s+', '', candidate).strip()
+                # Entity-less fillers: "a song", "some music", "something",
+                # "music", "a song on spotify" -> NOT a real search query.
+                _filler_only = re.fullmatch(
+                    r'(?:a|an|some|any|my)?\s*(?:song|songs|music|something|track|tune)?',
+                    candidate,
+                )
+                # "my liked songs" / "liked songs" / "favourites" is the
+                # Liked-Songs context, NOT a track title to search — let the
+                # dedicated liked branch handle it.
+                _is_liked = bool(re.search(r'\b(liked|favou?rite)s?\b', candidate))
+                if candidate and not _filler_only and not _is_liked:
+                    named_query = candidate
+
             _abort_model_turn(session)
-            if "pause" in clean_command or "stop" in clean_command:
+
+            # Genuine pause/stop: only when it's a transport command, not when
+            # "stop" is part of a song title like "play stop by spice girls".
+            is_pause = (
+                re.search(r'\b(pause|stop)\b', clean_command)
+                and named_query is None
+                and not clean_command.startswith("play")
+            )
+            if is_pause:
                 await run_tool_helper(spotify_pause)
                 await speak_local(session, "Music paused.")
-                return True
-            elif "play" in clean_command and "on spotify" not in clean_command:
-                await run_tool_helper(spotify_play)
-                await speak_local(session, "Resuming Spotify.")
                 return True
             elif "next" in clean_command or "skip" in clean_command:
                 await run_tool_helper(spotify_next)
@@ -1276,13 +1648,21 @@ async def route_command_directly(session: AgentSession, command: str) -> bool:
                 await run_tool_helper(spotify_previous)
                 await speak_local(session, "Previous song.")
                 return True
+            elif named_query:
+                await run_tool_helper(spotify_play_song, named_query)
+                await speak_local(session, f"Playing {named_query} on Spotify.")
+                return True
+            elif re.search(r'\b(liked|favou?rite)s?\b', clean_command):
+                await run_tool_helper(spotify_play_liked)
+                await speak_local(session, "Playing your liked songs.")
+                return True
             else:
-                m = re.search(r'play\s+(.+?)\s+on\s+spotify', clean_command)
-                if m:
-                    song = m.group(1).strip()
-                    await run_tool_helper(spotify_play_song, song)
-                    await speak_local(session, f"Playing {song} on Spotify.")
-                    return True
+                # Entity-less "play"/"play a song"/"play some music"/"resume":
+                # resume playback (or play liked songs), NEVER search the
+                # literal filler text.
+                await run_tool_helper(spotify_play)
+                await speak_local(session, "Playing your music.")
+                return True
 
         # Excel Data Entry
         excel_entry_match = re.search(r'(?:enter|write)\s+(.+?)\s+into\s+excel', clean_command)
@@ -1333,6 +1713,32 @@ async def route_command_directly(session: AgentSession, command: str) -> bool:
 
         # === NEW DIRECT ROUTES (Build 6) — close coverage gaps ===
 
+        # Local file search vs web search disambiguation (fixes D-01/3.1).
+        # "search this file", "search X on my computer", "find my resume in
+        # downloads" are LOCAL file searches, not web. A search is treated as
+        # local if it mentions a file/folder/document, a file extension, the
+        # computer/pc/laptop/drive, a known folder, or "this file".
+        _local_file_signals = (
+            r'\b(file|files|folder|folders|document|documents|'
+            r'pdf|docx?|xlsx?|pptx?|txt|csv|jpe?g|png|mp[34]|'
+            r'my\s+computer|my\s+pc|my\s+laptop|my\s+system|my\s+drive|'
+            r'this\s+(?:file|folder|document)|on\s+my\s+(?:computer|pc|laptop|system)|'
+            r'in\s+(?:downloads|documents|desktop|pictures|music|videos))\b'
+        )
+        file_search_match = re.search(r'(?:search|find|locate|look\s+for)\s+(?:for\s+)?(.+)', clean_command)
+        is_web_phrasing = bool(re.search(r'\b(the\s+web|online|on\s+google|on\s+the\s+internet)\b', clean_command)) or clean_command.startswith("google ")
+        if file_search_match and re.search(_local_file_signals, clean_command) and not is_web_phrasing:
+            raw = file_search_match.group(1).strip()
+            # Strip trailing scope/noise words so we search for the real name.
+            query = re.sub(r'\b(on\s+my\s+(?:computer|pc|laptop|system)|in\s+my\s+system|on\s+my\s+drive)\b.*$', '', raw).strip()
+            query = re.sub(r'^(this|the)\s+(file|folder|document)s?$', '', query).strip() or query
+            print(f"[ROUTER] Direct command matched: universal_file_opener({query}) [local search]")
+            _abort_model_turn(session)
+            result = await run_tool_helper(universal_file_opener, query)
+            response = result if isinstance(result, str) else f"Searching your computer for '{query}'."
+            await speak_local(session, response[:300])
+            return True
+
         # Web search — "search for X", "google X", "look up X"
         search_match = re.search(r'(?:search\s+(?:the\s+web\s+)?(?:for\s+)?|google\s+|look\s+up\s+)(.+)', clean_command)
         if search_match:
@@ -1366,20 +1772,46 @@ async def route_command_directly(session: AgentSession, command: str) -> bool:
             return True
 
         # System power — shutdown, restart, lock, sleep, hibernate
-        if any(x in clean_command for x in ["shut down", "shutdown", "restart", "reboot", "lock", "sleep", "hibernate"]):
-            action = "shutdown"
-            if "restart" in clean_command or "reboot" in clean_command:
-                action = "restart"
-            elif "lock" in clean_command:
-                action = "lock"
-            elif "sleep" in clean_command:
-                action = "sleep"
-            elif "hibernate" in clean_command:
-                action = "hibernate"
+        # System power - shutdown, restart, lock, sleep, hibernate.
+        # INTENT-ANCHORED matching (fixes D-02): previously a bare substring
+        # like "lock"/"sleep" anywhere in the utterance fired a power action,
+        # so "how do i block ads", "write about sleep apnea", "clock speed of
+        # my cpu" would LOCK/SLEEP the PC. Now each action requires a genuine
+        # power-command phrasing (a power verb aimed at the computer/system),
+        # never an incidental substring.
+        _power_action = None
+        # Guard: never treat an explanatory/question utterance as a power
+        # command ("what does shutdown mean", "how do i restart a router",
+        # "tell me how to shut down"). These are questions, not commands.
+        _is_question_or_explain = bool(re.search(
+            r'\b(what|how|why|when|does|mean|meaning|explain|tell me|guide|tutorial|a router|the router|my router|a modem)\b',
+            clean_command,
+        ))
+        _targets_computer = bool(re.search(r'\b(computer|pc|system|laptop|machine|windows|workstation|screen|my\s+(?:computer|pc|laptop))\b', clean_command))
+
+        if _is_question_or_explain:
+            _power_action = None
+        elif re.search(r'\b(shut\s*down|power\s*off|turn\s+off)\b(?!\s+(?:the\s+)?(?:volume|music|sound|screen\s+reader|wi-?fi|bluetooth|light|lights|tv|display))', clean_command) and (_targets_computer or clean_command.strip() in ("shut down", "shutdown", "power off", "turn off the computer", "turn off the pc", "shut down the computer", "shut down the pc", "shutdown the computer", "shutdown the pc")):
+            _power_action = "shutdown"
+        elif re.search(r'\b(restart|reboot)\b', clean_command) and (_targets_computer or clean_command.strip() in ("restart", "reboot", "restart the computer", "restart the pc", "reboot the computer", "reboot the pc", "restart my computer", "restart my pc")):
+            _power_action = "restart"
+        elif re.search(r'\bhibernate\b', clean_command) and (_targets_computer or clean_command.strip() in ("hibernate", "hibernate the computer", "hibernate the pc")):
+            _power_action = "hibernate"
+        elif re.search(r'\block\b\s+(?:the\s+|my\s+)?(?:computer|pc|system|laptop|screen|workstation|windows)\b', clean_command) or clean_command.strip() in ("lock", "lock it", "lock pc", "lock computer", "lock the computer", "lock my pc", "lock screen", "lock the screen"):
+            _power_action = "lock"
+        elif (
+            re.search(r'\b(?:go\s+to\s+sleep|put\s+(?:the\s+|my\s+)?(?:computer|pc|system|laptop|machine)\s+to\s+sleep|sleep\s+mode)\b', clean_command)
+            or clean_command.strip() in ("sleep", "sleep the computer", "sleep the pc", "put the pc to sleep", "put the computer to sleep")
+        ):
+            _power_action = "sleep"
+
+        if _power_action:
+            action = _power_action
 
             # Destructive/disruptive actions (shutdown/restart/hibernate) require
-            # explicit confirmation before executing — never fire on a single
-            # ambiguous utterance. Lock/sleep are reversible and execute immediately.
+            # explicit confirmation before executing - never fire on a single
+            # ambiguous utterance. Lock/sleep are reversible and execute
+            # immediately (but only now that matching is intent-anchored).
             if action in ("shutdown", "restart", "hibernate"):
                 print(f"[ROUTER] system_power_action({action}) requires confirmation - asking user")
                 _abort_model_turn(session)
@@ -1600,6 +2032,12 @@ def reset_active_timeout(session):
 
 async def handle_user_transcript(session: AgentSession, transcript: str):
     global turn_ctx, active_timeout_task
+    # Normalise to Latin/English here too so the TYPED input path
+    # (send_text_command -> handle_user_transcript) is covered as well as
+    # voice. Re-normalising already-English text is a cheap no-op (ASCII
+    # fast path), so this is safe even though the voice path already
+    # normalised in on_user_transcript.
+    transcript = normalize_transcript(transcript)
     clean_text = transcript.strip().lower()
     print(f"[ROUTER] received: {clean_text}")
     print(f"[VOICE] User speech transcript: '{clean_text}' (is_active={turn_ctx.is_active})")
@@ -1607,13 +2045,14 @@ async def handle_user_transcript(session: AgentSession, transcript: str):
     now = time.perf_counter()
 
     # --- TIMEOUT BACKSTOP ---
-    # If _turn_in_progress has been True for longer than 30s, force-reset it.
-    # This prevents the assistant from being permanently wedged if a turn
-    # completes without reaching any of the normal reset paths.
-    if turn_ctx.state != 'IDLE' and (now - turn_ctx.last_handled_at) > 30.0:
-        print(f"[ROUTER] SAFETY RESET — _turn_in_progress stuck for {now - turn_ctx.last_handled_at:.1f}s, force-clearing")
+    # If the turn has been non-IDLE for too long, force-reset so the
+    # assistant can't stay wedged. Lowered from 30s to 12s: 30s meant that
+    # after any stuck turn, every new command hit the PREEMPT path and felt
+    # ignored for half a minute. 12s comfortably covers the slowest real
+    # tool (ui_automation tier) while recovering quickly from a true wedge.
+    if turn_ctx.state != 'IDLE' and (now - turn_ctx.last_handled_at) > 12.0:
+        print(f"[ROUTER] SAFETY RESET - turn stuck for {now - turn_ctx.last_handled_at:.1f}s, force-clearing")
         turn_ctx.state = "IDLE"
-        
 
     if turn_ctx.state != 'IDLE':
         print(f"[ROUTER] PREEMPTING previous turn ({turn_ctx.state}) for new command: {clean_text}")
@@ -1663,12 +2102,17 @@ async def handle_user_transcript(session: AgentSession, transcript: str):
         active_timeout_task.cancel()
 
     turn_ctx.next_turn()  # Increment turn_id to cancel any lingering LLM background tools
-    
-    # CRITICAL: Abort Gemini's native audio auto-response BEFORE the direct router
-    # runs. This prevents the race condition where both Gemini's native response AND
-    # the direct router (or generate_reply fallback) produce duplicate bubbles.
-    _abort_model_turn(session)
-    
+
+    # LATENCY FIX (adopts the original MJ "native Gemini" ideology, spec
+    # D-05/WP5-4): DO NOT abort Gemini's native turn up front and then pay a
+    # SECOND model round-trip via generate_reply. Gemini Realtime already
+    # heard the audio and will answer / call tools natively in ONE round
+    # trip. We only short-circuit it when our fast direct router actually
+    # handles the command (each router intent calls _abort_model_turn itself
+    # right before it executes, so Gemini is interrupted exactly then - no
+    # double response). On a router MISS we let Gemini's native response
+    # proceed instead of the old abort + generate_reply text re-prompt that
+    # doubled latency.
     update_gui_status("Executing...")
     turn_ctx.state = "ROUTING"
     turn_ctx.last_handled_at = time.perf_counter()
@@ -1679,22 +2123,18 @@ async def handle_user_transcript(session: AgentSession, transcript: str):
         turn_ctx.last_handled_at = time.perf_counter()
         _finish_direct_turn(session)
     else:
-        print(f"[ROUTER] Direct routing failed, generating reply via LLM for: '{clean_text}'")
+        # Router miss: let Gemini's native turn answer (ONE round-trip, like
+        # the original fast MJ). No up-front abort, no generate_reply
+        # re-prompt. This removes the biggest source of per-turn latency.
+        print(f"[ROUTER] No direct match - letting Gemini respond natively: '{clean_text}'")
         turn_ctx.state = "LLM_EXECUTION"
         update_gui_status("Processing...")
         timer.t5 = time.perf_counter()
-        print("[T5] LLM request started (sole response path - native audio already aborted)")
-        await _generate_reply_with_retry(session, transcript)
         turn_ctx.last_handled_transcript = clean_text
         turn_ctx.last_handled_at = time.perf_counter()
-        # CRITICAL FIX: the LLM-fallback branch previously never reset
-        # turn_ctx.state back to IDLE (only the direct-router branch did, via
-        # _finish_direct_turn). That left state stuck at "LLM_EXECUTION" after
-        # any Gemini-routed command, so every subsequent turn hit the
-        # "PREEMPTING previous turn" path and the assistant felt wedged until
-        # the 30s safety backstop fired — exactly the "works for 2-3 commands
-        # then gets stuck in a loop" symptom. Always return to idle listening
-        # here so follow-up commands route cleanly.
+        # Return to idle listening; Gemini's own native response/tool-calls
+        # complete the turn, and agent_state_changed flips state to IDLE when
+        # Gemini finishes speaking.
         _finish_direct_turn(session)
 
 # =========================
@@ -1768,6 +2208,16 @@ def _init_global_llm():
     if _global_llm is None:
         if network_available:
             print("🧠 Initializing Gemini Realtime LLM once...")
+            # NOTE (latency regression 2026-10-23): adding model-level
+            # language / input_audio_transcription / thinking_config(0) to
+            # this native-audio model caused speech_to_transcript to balloon
+            # from ~8-15s to 49-72s (confirmed in tony_perf_history.db). The
+            # native-audio pipeline evidently does not handle those extra
+            # options well (likely a server-side renegotiation/stall). They
+            # are REMOVED. The English-only behaviour is handled at the
+            # prompt level (core/prompts.py), which does NOT touch the
+            # realtime session and did not regress latency. Keep this config
+            # minimal — it is the known-good fast path.
             _global_llm = RealtimeModel(
                 model="gemini-2.5-flash-native-audio-preview-12-2025",
                 voice="Aoede",  # Female voice
@@ -1815,21 +2265,37 @@ class UltimateAdvancedTony(Agent):
             browser_automate,
             send_email,
             perform_computer_action,
+            # N-01 FIX: the direct router only matches rigid phrasings, so
+            # natural phrasings ("send a message to Naveen", "play a song",
+            # "open whatsapp") fall through to Gemini — which previously had
+            # NO tool to actually do these. Register the core action tools so
+            # the LLM path can execute them too, not just the router.
+            open_app, manage_window, desktop_control,
+            send_whatsapp_message, send_media_to_whatsapp,
+            spotify_play_song, spotify_play, spotify_pause, spotify_next,
+            spotify_previous, spotify_play_liked, open_spotify,
+            play_media,
+            universal_file_opener, create_here,
+            control_system_volume, control_screen_brightness,
+            press_key, type_user_message_auto, scroll_content,
+            click_on_screen_text, read_screen_text, screen_short,
+            get_system_status, scan_system_for_viruses,
+            word_to_pdf, excel_to_pdf, image_to_pdf,
         ]
 
         wrapped_tools = [make_timing_decorator(t) for t in tools]
+        # MJ-PARITY FIX (latency + stuck-in-idle): the original fast MJ
+        # `agent.py` passes ONLY instructions/tools/llm to Agent.__init__ —
+        # NO vad=, NO min/max_endpointing_delay. It relies on the SDK's tuned
+        # defaults. Our aggressive overrides (endpointing 0.05/0.20, custom
+        # Silero thresholds) interact badly with the native-audio turn
+        # detection and were a prime suspect for both the ballooning latency
+        # and the turn-state desync that left Tony "stuck in idle" after a few
+        # commands. Matching MJ: remove all of them, use SDK defaults.
         super().__init__(
             instructions=self._build_instructions(),
             tools=wrapped_tools,
             llm=self._init_llm(),
-            min_endpointing_delay=0.05,
-            max_endpointing_delay=0.20,
-            vad=silero.VAD.load(
-                activation_threshold=0.3,
-                deactivation_threshold=0.25,
-                min_speech_duration=0.03,
-                min_silence_duration=0.25
-            ),
         )
 
         print(f"[OK] Tony initialized with {len(tools)} tools")
@@ -2050,6 +2516,7 @@ def _run_startup_self_check() -> None:
 # =========================
 _greeting_sent = False
 
+
 async def entrypoint(ctx: agents.JobContext):
     # Ignore handshake-room job assignments
     if ctx.room.name == "handshake-room":
@@ -2058,6 +2525,10 @@ async def entrypoint(ctx: agents.JobContext):
 
     print("[INFO] Starting Tony...")
     _run_startup_self_check()
+    # Item 5: establish this run's session-scoped conversations DB now, so
+    # the orphan-sweep of any leftover session DBs from a previous unclean
+    # exit runs at startup (not lazily mid-turn).
+    _get_session_db_path()
     global active_session, background_loop, active_room, worker_loop
     active_room = ctx.room
     worker_loop = asyncio.get_running_loop()
@@ -2066,6 +2537,15 @@ async def entrypoint(ctx: agents.JobContext):
     update_gui_connection("LiveKit: Connecting... | Gemini: Offline")
 
     agent = UltimateAdvancedTony()
+    # NOTE (latency regression 2026-10-23): the SDK-level self-echo options
+    # (turn_handling=TurnHandlingOptions(interruption=InterruptionOptions(
+    # discard_audio_if_uninterruptible=True, min_words=3))) were REMOVED.
+    # They were added the same session as the RealtimeModel config change and
+    # latency regressed badly (speech_to_transcript 8-15s -> 49-72s). To
+    # return to the known-good fast path we keep AgentSession() plain. Echo is
+    # still defended at the application level by the pure-Python _is_self_echo
+    # guard in on_user_transcript (no realtime-pipeline interaction, so no
+    # latency risk).
     session = AgentSession()
     active_session = session
     background_loop = worker_loop
@@ -2087,7 +2567,11 @@ async def entrypoint(ctx: agents.JobContext):
                     session.interrupt(force=True)
                 except Exception:
                     pass
-        elif ev.new_state == "idle":
+        elif ev.new_state in ("listening", "away"):
+            # LiveKit's UserState is 'speaking' | 'listening' | 'away' - there
+            # is no 'idle'. The old check never matched, so t2 (speech end)
+            # was never recorded and speech->transcript was measured from
+            # speech START (inflated by however long you spoke).
             timer.t2 = time.perf_counter()
             print("[T2] speech ended")
             print("[VAD] speech ended")
@@ -2096,19 +2580,81 @@ async def entrypoint(ctx: agents.JobContext):
     @session.on("user_input_transcribed")
     def on_user_transcript(ev: agents.voice.UserInputTranscribedEvent):
         global is_speaking_locally, last_local_speech_end
-        if is_speaking_locally or (time.perf_counter() - last_local_speech_end < 0.8):
+        raw = ev.transcript
+        if not (raw and raw.strip()):
             return
-        if ev.transcript.strip():
-            # Stream partial/final transcript into a single bubble
-            update_gui_partial_transcript(ev.transcript, ev.is_final)
-            if ev.is_final:
-                timer = get_or_create_timer()
-                timer.t3 = time.perf_counter()
-                timer.command = ev.transcript
-                print(f"[T3] transcript received: '{ev.transcript}'")
-                print(f"[STT] transcript received: {ev.transcript}")
 
-                asyncio.create_task(handle_user_transcript(session, ev.transcript))
+        # RESPONSIVENESS FIX (D-07): previously ALL transcripts were dropped
+        # while Tony was speaking its confirmation and for 0.8s after, so the
+        # user had to wait for Tony to finish talking before the next command
+        # was even accepted — the main source of perceived latency between
+        # commands. Now we do NOT blanket-drop during speech. Instead we let
+        # the transcript through and rely on the echo-similarity guard in
+        # handle_user_transcript to discard only genuine self-echo (a
+        # transcript that closely matches Tony's own last spoken line). A
+        # real, different command spoken over/right after the confirmation is
+        # accepted immediately.
+        normalized = normalize_transcript(raw)
+
+        # SELF-ECHO GUARD: drop Tony's own TTS re-captured by the mic (during
+        # speech OR in the short tail after it), using tolerant matching so
+        # garbled re-captures are caught too. Exempts the slot-fill case so a
+        # real short user answer is never eaten.
+        _now = time.perf_counter()
+        _awaiting_slot = turn_ctx.pending_slot is not None
+        if _is_self_echo(normalized, _now, _awaiting_slot):
+            print(f"[ECHO] dropped self-echo transcript: raw='{raw}' normalized='{normalized}'")
+            return
+
+        # Stream the ENGLISH transcript into the bubble.
+        update_gui_partial_transcript(normalized, ev.is_final)
+        if ev.is_final:
+            # NOISE GUARD: VAD can trigger on background sound/coughs/clicks,
+            # and the STT then returns noise-only text (".", "<noise>", a lone
+            # stray letter). Without this, that noise was routed as a real
+            # command and could fold into / override the actual command. Drop
+            # it here so only genuine commands reach the router.
+            if _looks_like_noise(normalized):
+                print(f"[NOISE] dropped non-command final transcript: raw='{raw}' normalized='{normalized}'")
+                # Gemini heard the same audio and would answer it natively
+                # (e.g. "I understand you are asking where is the train") or
+                # re-run an earlier tool from context. Stop that reply too.
+                _abort_model_turn(session)
+                update_gui_status("Listening...")
+                return
+            timer = get_or_create_timer()
+            timer.t3 = time.perf_counter()
+            timer.command = normalized
+            print(f"[T3] transcript received (raw='{raw}' -> normalized='{normalized}')")
+            print(f"[STT] transcript received: {normalized}")
+
+            # Cancel any still-running previous turn task so orphaned
+            # tasks don't accumulate and queue on _input_lock. BUT never
+            # cancel while a tool is mid-execution: cancelling the asyncio
+            # task does NOT stop the running executor thread (keyboard/mouse
+            # automation), it only orphans it, and those orphans piled up and
+            # wedged the assistant into idle after a few commands. If a tool
+            # is executing, let it finish; the new turn still becomes active
+            # and is handled once the lock frees.
+            global _active_turn_task
+            if (_active_turn_task is not None and not _active_turn_task.done()
+                    and not _tool_executing):
+                _active_turn_task.cancel()
+
+            task = asyncio.create_task(handle_user_transcript(session, normalized))
+            _active_turn_task = task
+
+            def _clear_turn_task(t):
+                global _active_turn_task
+                if _active_turn_task is t:
+                    _active_turn_task = None
+                # Surface (log) any non-cancellation exception.
+                if not t.cancelled():
+                    exc = t.exception()
+                    if exc:
+                        print(f"[TURN] task error: {exc!r}")
+
+            task.add_done_callback(_clear_turn_task)
     @session.on("agent_state_changed")
     def on_agent_state(ev: agents.voice.AgentStateChangedEvent):
         print(f"[AGENT] State changed: {ev.old_state} -> {ev.new_state}")
@@ -2244,7 +2790,7 @@ async def _load_history_to_gui():
     try:
         await asyncio.sleep(1.5)  # Small delay — let GUI settle first
         from memory_db import MemoryDatabase
-        db = MemoryDatabase()
+        db = MemoryDatabase(db_path=str(_get_session_db_path()))
         history = db.get_conversation_history(limit=20)
         if not history:
             return
@@ -2255,7 +2801,7 @@ async def _load_history_to_gui():
             return
         for conv in reversed(history):
             sender = "You" if conv.role == "user" else "TONY"
-            content = conv.content.strip()
+            content = normalize_transcript(conv.content.strip())
             if content:
                 try:
                     cb(sender, content[:250])
@@ -2295,5 +2841,5 @@ if __name__ == "__main__":
         print("[OK] TONY GUI starting...")
         
         # Import and run Tony interface
-        import Tony
-        sys.exit(Tony.main())
+        import tony
+        sys.exit(tony.main())

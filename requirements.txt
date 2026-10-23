@@ -1,41 +1,67 @@
-livekit-agents
-livekit-plugins-openai
-livekit-plugins-silero
-livekit-plugins-google
-livekit-plugins-noise-cancellation
-mem0ai
-duckduckgo-search
-langchain_community
-requests
-python-dotenv
-openpyxl
-pygetwindow
-pyautogui
-psutil
-pillow
-opencv-python
-mss
-pytesseract
-wikipedia
-pyperclip
-screen-brightness-control
-pycaw
-beautifulsoup4
-flask
-firebase-admin
-librosa
-feedparser
-PyPDF2
-python-docx
-chardet
-pandas
-PyQt5
-keyboard
-plotly
-statsmodels
-python-pptx
-playwright
-pywin32
-pytest
-pytest-asyncio
+# Tony voice assistant - Windows 10/11, Python 3.12 (64-bit)
+#
+# Install (from the repository root):
+#   python -m venv .venv
+#   .\.venv\Scripts\Activate.ps1
+#   python -m pip install --upgrade pip
+#   python -m pip install -r requirements.txt
+#   python -m playwright install chromium      # one-time, for browser_automate
+#
+# Every package below is imported somewhere in the code base (audited with an
+# AST scan of all .py files). Versions are the exact ones the app and the
+# full test suite were verified with.
 
+# --- Voice pipeline (LiveKit + Gemini Realtime) ------------------------------
+livekit-agents==1.8.0
+livekit==1.1.17
+livekit-api==1.2.1
+livekit-plugins-google==1.8.0
+livekit-plugins-silero==1.8.0
+livekit-plugins-noise-cancellation==0.3.0
+google-genai==2.22.0
+sounddevice==0.5.6              # microphone/speaker I/O used by livekit MediaDevices
+numpy==2.5.3
+aiohttp==3.14.3
+python-dotenv==1.2.3
+
+# --- Desktop UI -------------------------------------------------------------
+PyQt5==5.15.11
+psutil==7.2.2
+firebase-admin==7.5.0           # optional cloud activation path (bypassed in local mode)
+
+# --- Windows automation -----------------------------------------------------
+pywin32==312
+comtypes==1.4.16                # Windows UI Automation (verified WhatsApp sending)
+PyAutoGUI==0.9.54
+PyGetWindow==0.0.9
+pyperclip==1.11.0
+pycaw==20251023                 # system volume
+screen-brightness-control==0.27.2
+Send2Trash==2.1.0               # file delete -> Recycle Bin
+
+# --- Vision / OCR -----------------------------------------------------------
+pillow==12.3.0
+opencv-python==5.0.0.93
+pytesseract==0.3.13             # also needs the Tesseract OCR program (see README)
+
+# --- Web, search, news ------------------------------------------------------
+requests==2.34.2
+feedparser==6.0.14
+langchain-community==0.4.2      # web_scraper (WebBaseLoader)
+beautifulsoup4==4.15.0          # required by WebBaseLoader
+playwright==1.64.1              # browser_automate (run: python -m playwright install chromium)
+
+# --- Documents / Office -----------------------------------------------------
+openpyxl==3.1.5
+pandas==3.0.5
+python-docx==1.2.0
+python-pptx==1.0.2
+PyPDF2==3.0.1
+chardet==7.6.0
+
+# --- Language handling (Hindi/Hinglish -> English letters) ------------------
+Unidecode==1.4.0
+
+# --- Tests ------------------------------------------------------------------
+pytest==9.1.1
+pytest-asyncio==1.4.0

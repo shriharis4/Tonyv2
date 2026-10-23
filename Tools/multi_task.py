@@ -31,15 +31,20 @@ async def execute_multi_task(tasks: list[dict]) -> str:
             results.append(f"⚠️ Task {idx}: 'tool_name' missing.")
             continue
 
-        # Dynamically get the function
-        tool_func = globals().get(tool_name)
+        # Resolve the tool from the single-source registry (fixes D-04/H-17:
+        # the old globals().get(tool_name) looked in THIS module's globals,
+        # which only contain `function_tool`, so every lookup returned None
+        # and every step reported "Tool not found").
+        from tool_registry import get_tool_by_name
+        tool_func = get_tool_by_name(tool_name)
         if not tool_func:
             results.append(f"⚠️ Task {idx}: Tool '{tool_name}' not found.")
             continue
 
         try:
-            # Execute the tool and wait for completion before next
-            result = await tool_func(**params)
+            # Unwrap the FunctionTool wrapper to the raw awaitable if needed.
+            target = getattr(tool_func, "_func", None) or getattr(tool_func, "__wrapped__", None) or tool_func
+            result = await target(**params)
             results.append(f"✅ Task {idx} ({tool_name}) executed: {result}")
         except Exception as e:
             results.append(f"❌ Task {idx} ({tool_name}) failed: {str(e)}")

@@ -67,10 +67,61 @@ def _create_tables(conn):
 class MemoryDatabase:
     """SQLite-backed conversation history storage"""
 
-    def __init__(self, db_path: str = "tony_memory.db"):
-        """Initialize or connect to the conversation database"""
+    def __init__(self, db_path: str = "tony_memory.db",
+                 perf_db_path: str = None):
+        """Initialize or connect to the conversation database.
+
+        `db_path` holds the `conversations` table and may be a per-SESSION
+        file that is deleted on clean shutdown (see runtime_agent's
+        session-DB wiring). `perf_db_path` holds the `turn_timings` table
+        and is intentionally a SEPARATE, PERSISTENT file that is never
+        deleted — it is the latency-diagnosis history that made the whole
+        investigation possible, so it must survive across sessions even
+        when conversation history is wiped. The two concerns (chat-history
+        privacy/size vs. perf instrumentation) happen to have historically
+        shared one file; this keeps them apart.
+
+        When `perf_db_path` is not given, it defaults to
+        `tony_perf_history.db` placed in the SAME directory as `db_path`.
+        This keeps the perf history as a stable sibling of the (possibly
+        per-session) conversations DB in production, while test suites that
+        point `db_path` at a tmp dir automatically get an isolated perf file
+        in that same tmp dir rather than polluting a shared one.
+        """
         self.db_path = Path(db_path)
+        if perf_db_path is None:
+            self.perf_db_path = self.db_path.parent / "tony_perf_history.db"
+        else:
+            self.perf_db_path = Path(perf_db_path)
         self._ensure_schema()
+        self._ensure_perf_schema()
+
+    def _ensure_perf_schema(self):
+        """Create the turn_timings table in the persistent perf DB. Separate
+        from _ensure_schema so a per-session conversations DB and the
+        persistent perf DB can live in different files. Best-effort."""
+        try:
+            conn = sqlite3.connect(self.perf_db_path)
+            try:
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS turn_timings (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        timestamp TEXT NOT NULL,
+                        command TEXT,
+                        route TEXT,
+                        total_latency REAL,
+                        speech_to_transcript REAL,
+                        transcript_to_router REAL,
+                        router_to_tool REAL,
+                        tool_duration REAL,
+                        tts_duration REAL
+                    )
+                """)
+                conn.commit()
+            finally:
+                conn.close()
+        except Exception as e:
+            logger.warning(f"[MEMORY_DB] perf schema init failed: {e}")
 
     def _recover_corrupt_db(self):
         """If the DB file exists but isn't a valid SQLite database, back it
@@ -223,7 +274,7 @@ class MemoryDatabase:
         regressions are visible in data, not guessed at. Best-effort: never
         raises into the turn pipeline."""
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with sqlite3.connect(self.perf_db_path) as conn:
                 conn.execute(
                     """
                     INSERT INTO turn_timings (
@@ -254,7 +305,7 @@ class MemoryDatabase:
         """Return the most recent turn-timing rows (newest first) for
         offline latency analysis / computing p50/p95."""
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with sqlite3.connect(self.perf_db_path) as conn:
                 conn.row_factory = sqlite3.Row
                 cursor = conn.execute(
                     "SELECT * FROM turn_timings ORDER BY id DESC LIMIT ?",

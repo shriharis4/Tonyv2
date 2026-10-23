@@ -252,3 +252,17 @@ def get_all_tool_functions() -> list:
         delete_file_or_folder, search_files_by_content, zip_paths, unzip_archive,
         batch_rename, browser_automate, send_email,
     ]
+
+
+def get_tool_by_name(name: str):
+    """Resolve a tool function by its name (the underlying `__name__`,
+    unwrapping the FunctionTool wrapper if present). Returns the raw
+    awaitable/callable, or None if not registered. Used by
+    execute_multi_task so it can dispatch by tool name instead of the
+    broken globals() lookup in its own module."""
+    for fn in get_all_tool_functions():
+        target = getattr(fn, "_func", None) or getattr(fn, "__wrapped__", None) or fn
+        if getattr(target, "__name__", None) == name or getattr(fn, "__name__", None) == name:
+            return fn
+    return None
+

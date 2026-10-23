@@ -168,13 +168,24 @@ async def delete_file_or_folder(path: str, confirm: bool = False) -> str:
         loop = asyncio.get_running_loop()
 
         def _delete():
-            if os.path.isdir(target):
-                shutil.rmtree(target)
-            else:
-                os.remove(target)
+            # Prefer the Recycle Bin (restorable) over permanent deletion
+            # (H-06). Falls back to permanent delete only if send2trash is
+            # unavailable, and reports which path was taken.
+            try:
+                import send2trash
+                send2trash.send2trash(target)
+                return "recycled"
+            except ImportError:
+                if os.path.isdir(target):
+                    shutil.rmtree(target)
+                else:
+                    os.remove(target)
+                return "permanently_deleted"
 
-        await loop.run_in_executor(None, _delete)
-        return ok(f"Deleted {target}")
+        outcome = await loop.run_in_executor(None, _delete)
+        if outcome == "recycled":
+            return ok(f"Moved {target} to the Recycle Bin")
+        return ok(f"Deleted {target}", detail="permanent (send2trash not installed)")
     except Exception as e:
         return fail("Delete failed", detail=str(e))
 

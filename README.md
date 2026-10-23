@@ -1,185 +1,121 @@
 # Tony
 
-Tony is a Windows desktop AI assistant that combines voice interaction, agent orchestration, and local desktop automation. It connects to LiveKit for real-time voice sessions and uses a configured AI provider for intelligent responses and tool execution.
-
-This project includes a desktop UI, an agent runtime, prompt management, and a collection of Windows automation tools for tasks such as file handling, browser interaction, messaging, scheduling, document work, screenshots, app launching, and system actions.
+Tony is a Windows desktop AI assistant combining voice interaction, agent orchestration, and local desktop automation. It connects to LiveKit for real-time voice sessions and uses Google Gemini for intelligent responses and tool execution.
 
 ## Features
 
-- LiveKit-based voice sessions
-- Real-time AI assistant runtime with a hybrid keyword router + LLM tool-calling fallback
-- Tiered timeouts and structured success/failure results on every tool call
-- Rotating structured logs (`logs/tony.log`, `logs/routing_accuracy.log`) instead of console-only output
-- Retry-with-backoff and graceful degraded mode when the AI engine is unreachable
-- Destructive-action confirmation gating (shutdown/restart/hibernate, file deletion)
-- Desktop automation tools for Windows
-- File, folder, and app operations — including rename/move/copy/delete, zip/unzip, batch rename, and content search
-- Document authoring and editing: real Word (.docx), Markdown, and plain-text files; PowerPoint slide creation/editing
-- Excel formula entry and chart creation, beyond basic cell data entry
-- Real browser automation (Playwright) for navigating and filling forms, in addition to web search/scraping
+- LiveKit-based voice sessions with Gemini Realtime (`gemini-2.5-flash-native-audio-preview`)
+- Hybrid keyword router with LLM tool-calling fallback — most commands execute in under 2 seconds
+- Hardware echo cancellation so Tony never routes its own voice as a command
+- Verified WhatsApp Desktop automation (reads UI controls, confirms contact before sending, never false-reports success)
+- File, folder, and app operations — rename/move/copy/delete, zip/unzip, batch rename, content search
+- Document authoring: Word (.docx), Markdown, plain text, PowerPoint, Excel
+- Real browser automation (Playwright) for forms and navigation
+- OCR-based screen interaction (Tesseract, optional)
 - Email sending via configured SMTP
-- OCR-based "click the X button" vision-guided clicking, wired into the general desktop-action fallback
-- Media, screenshot, and productivity utilities
-- Local SQLite memory storage with schema versioning and corruption recovery
-- PyQt-based desktop interface
-- Automated test suite (`pytest`, see `tests/`)
+- Media, screenshot, Spotify, YouTube, and productivity tools
+- PyQt5 desktop HUD
+- Structured rotating logs, per-turn latency database (`tony_perf_history.db`), automated test suite
 
 ## Requirements
 
-Before running the project, make sure you have:
+- **Windows 10 or Windows 11**
+- **Python 3.12** (64-bit) — [python.org/downloads](https://www.python.org/downloads/)
+- **Git**
+- A [LiveKit](https://livekit.io) project with `LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET`
+- A [Google AI Studio](https://aistudio.google.com) `GOOGLE_API_KEY` with the Gemini Live API enabled
+- **Tesseract OCR** (optional, for screen-text clicking) — [GitHub installer](https://github.com/UB-Mannheim/tesseract/wiki)
 
-- Windows 10 or Windows 11
-- Python 3.12
-- Git
-- A LiveKit project and valid credentials
-- API/model credentials for the configured AI provider
-- Desktop automation permissions for Windows actions
-- (Optional) SMTP credentials if you want `send_email` to actually send mail
-- (Optional) Tesseract OCR installed and on PATH for OCR-based screen-text/click features
-
-## Clone the project
+## Quick start (new device)
 
 ```powershell
+# 1 — clone
 git clone https://github.com/shriharis4/Tonyv2.git
 cd Tonyv2
-```
 
-## Set up the environment
-
-Create a virtual environment and install dependencies:
-
-```powershell
+# 2 — virtual environment
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
+
+# 3 — dependencies  (all pinned; ~9 min on first run)
 python -m pip install -r requirements.txt
-```
 
-Browser automation (`browser_automate`) uses Playwright, which needs its
-browser binaries installed once after `pip install`:
+# 4 — browser binaries for browser_automate  (one-time, ~300 MB)
+python -m playwright install chromium
 
-```powershell
-playwright install chromium
-```
-
-## Configure environment variables
-
-Create a local environment file:
-
-```powershell
+# 5 — credentials
 Copy-Item .env.example .env
-```
+#  open .env and fill in LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET, GOOGLE_API_KEY
 
-Then update `.env` with the required values for your LiveKit and AI provider setup. Do not commit `.env` to Git.
-
-Environment variables used by the app:
-
-| Variable | Required | Purpose |
-| --- | --- | --- |
-| `LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET` | Yes | LiveKit voice session connection |
-| `LIVEKIT_AGENT_NAME` | No | Agent name registered with LiveKit (defaults to `tony`) |
-| `GOOGLE_API_KEY` | Yes (for Gemini Realtime) | AI provider credential |
-| `GROQ_API_KEY`, `OPENAI_API_KEY` | No | Used by specific tools (e.g. code-fix helper) if configured |
-| `USER_NAME` | No | How Tony addresses you (defaults to `Sir`) |
-| `TONY_VARIANT`, `LAN` | No | Persona/language variant selection |
-| `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD`, `SMTP_FROM_EMAIL` | No | Enables `send_email`. If any are missing, the tool returns a clear "email isn't configured" message instead of failing silently |
-
-## Run the app
-
-Start the project with:
-
-```powershell
+# 6 — run
 .\.venv\Scripts\python .\main.py
 ```
 
-This launches the desktop assistant and starts the runtime agent flow.
+## Environment variables
 
-## Running tests
+| Variable | Required | Purpose |
+|---|---|---|
+| `LIVEKIT_URL` | Yes | `wss://your-project.livekit.cloud` |
+| `LIVEKIT_API_KEY` | Yes | LiveKit API key |
+| `LIVEKIT_API_SECRET` | Yes | LiveKit API secret |
+| `GOOGLE_API_KEY` | Yes | Google Gemini Realtime credential |
+| `LIVEKIT_AGENT_NAME` | No | Agent name (default `tony`) |
+| `USER_NAME` | No | How Tony addresses you (default `Sir`) |
+| `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD`, `SMTP_FROM_EMAIL` | No | Enables `send_email`; missing = clear "not configured" message |
 
-The project includes an automated test suite covering the direct router
-(including word-boundary intent matching and destructive-action
-confirmation gating), tool timeout tiering, the structured result
-contract, tool registry de-duplication, the new coverage tools, and
-Gemini retry/degraded-mode behavior. Everything is mocked — no real
-desktop actions, network calls, or file deletions occur.
+Never commit `.env` — it is already in `.gitignore`.
+
+## Run tests
 
 ```powershell
-python run_tests.py
+.\.venv\Scripts\python -m pytest tests/ -v
 ```
 
-or directly with pytest:
-
-```powershell
-pytest tests/ -v
-```
-
-Some test-matrix rows (real voice I/O, real Spotify/WhatsApp automation,
-real system power actions, real virus scans, Hindi/Hinglish voice parity,
-network-loss degradation on real hardware) require a physical Windows
-machine with LiveKit connected and cannot be safely run in CI — see
-`tests/MANUAL_QA_CHECKLIST.md` for that checklist.
+All 254 tests run entirely offline (no real mic, network, or desktop actions). They also write to `logs/tony_test.log` so the real latency log is never rotated away during a test run.
 
 ## Project structure
 
-- `main.py` — application entry point
-- `tony.py` — PyQt interface and app startup logic
-- `core/runtime_agent.py` — runtime agent, direct router, and tool execution/timeout/logging logic
-- `core/prompts.py` — system and session prompt definitions, including the tool-calling manifest
-- `core/logging_config.py` — rotating structured logging setup
-- `core/agent.py` — core agent exports
-- `tool_registry.py` — single source of truth for tool registration; both `tools.py` and `core/runtime_agent.py` import from here
-- `tools.py` — thin facade re-exporting `tool_registry`
-- `Tools/` — automation and productivity tool modules
-- `memory_db.py` — local SQLite memory database with schema versioning
-- `tests/` — automated test suite (pytest) and manual QA checklist
-- `run_tests.py` — one-command test runner
-- `requirements.txt` — Python dependencies
-- `livekit.toml` — LiveKit configuration
+| Path | Purpose |
+|---|---|
+| `main.py` | Entry point |
+| `tony.py` | PyQt5 HUD, LiveKit client, audio device setup (AEC) |
+| `core/runtime_agent.py` | Agent loop, VAD, router, turn lifecycle, tool wrapper |
+| `core/prompts.py` | System and session instructions (English-only output) |
+| `core/textnorm.py` | Hindi/Hinglish → English transliterator |
+| `core/logging_config.py` | Rotating log setup (respects `TONY_LOG_FILE` env var for tests) |
+| `tool_registry.py` | Single source of truth for all 61 tool registrations |
+| `tools.py` | Re-exports `tool_registry` |
+| `memory_db.py` | SQLite — per-session conversations DB + persistent `tony_perf_history.db` |
+| `Tools/` | All automation and productivity tool modules |
+| `tests/` | pytest suite (254 tests) |
+| `requirements.txt` | Pinned dependencies for a clean install |
 
 ## Runtime flow
 
-The main execution path is:
-
-```text
-main.py -> tony.py -> core/runtime_agent.py
+```
+main.py → tony.py → core/runtime_agent.py (agent thread)
+                  → livekit client thread (mic + speaker with AEC)
 ```
 
-The runtime agent is responsible for connecting the UI, the voice session, and the tool layer. Each voice turn first tries the direct keyword router (fast path, no network round trip); if nothing matches, it falls through to the Gemini Realtime model with retry-with-backoff and a graceful degraded mode if the AI engine is unreachable.
+**Turn pipeline:** VAD detects speech end → Gemini returns transcript → keyword router tries direct match (< 2 ms) → on match, tool runs via `execute_tool` (tiered timeouts, input lock) → on miss, Gemini native response handles it. Gemini tool calls go through the same lock and are blocked if the router already handled the command, preventing double execution.
 
-## Logs & diagnostics
+## Latency notes
 
-Structured logs are written to `logs/tony.log` (rotating, 5MB x 5 backups) and `logs/routing_accuracy.log` (every transcript → matched intent → tool → result tuple, for offline accuracy review). These are gitignored and created automatically on first run.
+- `speech_to_transcript` (VAD silence → transcript) is the dominant term; it tracks the Gemini Live API round-trip.
+- All other stages (router, tool, TTS confirmation) are under 2 s in normal use.
+- Per-session timings are written to `tony_perf_history.db` after every turn. Query with `SELECT * FROM turn_timings ORDER BY id DESC LIMIT 20` to see the breakdown.
 
-## Troubleshooting
+## Known limitations
 
-### Virtual environment is not active
-Use:
+- Tesseract OCR binary is not installed automatically; OCR-based screen-click features show a warning at startup until it is added to `PATH`.
+- `send_email` requires SMTP credentials in `.env`; missing = graceful "not configured" reply.
+- WhatsApp Desktop send requires WhatsApp to be installed as the Microsoft Store app (`WhatsApp.Root.exe`). It reads UI controls to confirm the right contact before sending.
 
-```powershell
-.\.venv\Scripts\Activate.ps1
-```
+## Security
 
-### Dependencies do not install
-Make sure you are using Python 3.12 and that your virtual environment is activated before running pip.
-
-### Credentials are missing
-Check your `.env` file and confirm all required LiveKit and AI provider values are present.
-
-### Windows automation does not work
-Some actions may require user interaction, desktop accessibility permissions, or admin access depending on your Windows configuration.
-
-### Browser automation fails with a Playwright error
-Run `playwright install chromium` after installing requirements.
-
-### Email sending says "not configured"
-Set `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, and `SMTP_PASSWORD` in `.env`.
-
-## Security note
-
-Never commit secrets, API keys, or local runtime data to Git. Keep `.env` and any sensitive credentials outside the repository whenever possible.
+Never commit `.env`, `service.json`, or `tony_perf_history.db`. All three are already covered by `.gitignore`.
 
 ## License
 
-This project is provided as-is for development and personal use. If you plan to distribute or deploy it, review any dependency or service license requirements before doing so.
-
-
+Provided as-is for development and personal use. Review dependency licenses before distributing.
